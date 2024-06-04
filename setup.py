@@ -115,6 +115,11 @@ setup(
             extra_compile_args = ['-std=c++11'],
             include_dirs = get_numpy_include_dirs() + [qhull_root, nanoflann_root],
         ),
+        Extension(
+            'stardist.lib.starfinity',
+            sources=['stardist/lib/starfinity.cpp'],
+            include_dirs=get_numpy_include_dirs(),
+        )
     ],
 
     package_data={'stardist': [ 'kernels/*.cl', 'data/images/*' ]},
