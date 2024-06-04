@@ -24,6 +24,8 @@ from ..matching import relabel_sequential
 from ..geometry import star_dist3D, polyhedron_to_label
 from ..rays3d import Rays_GoldenSpiral, rays_from_json
 from ..nms import non_maximum_suppression_3d, non_maximum_suppression_3d_sparse
+from ..affinity import dist_to_affinity3D, max_sparsify
+from skimage.segmentation import watershed
 
 _gen_rtype = list if IS_TF_1 else tuple
 
@@ -586,7 +588,7 @@ class StarDist3D(StarDistBase):
         return history
 
 
-    def _instances_from_prediction(self, img_shape, prob, dist, points=None, prob_class=None, prob_thresh=None, nms_thresh=None, overlap_label=None, return_labels=True, scale=None, **nms_kwargs):
+    def _instances_from_prediction(self, img_shape, prob, dist, points=None, prob_class=None, prob_thresh=None, nms_thresh=None, overlap_label=None, return_labels=True, scale=None,  affinity=False, affinity_thresh=None,**nms_kwargs):
         """
         if points is None     -> dense prediction
         if points is not None -> sparse prediction
@@ -629,8 +631,29 @@ class StarDist3D(StarDistBase):
             rescale = (1,1,1)
 
         if return_labels:
-            labels = polyhedron_to_label(disti, points, rays=rays, prob=probi, shape=img_shape, overlap_label=overlap_label, verbose=verbose)
+            if affinity:
+                zoom_factor = tuple(s1 / s2 for s1, s2 in zip(img_shape, prob.shape))
+                aff, aff_neg = dist_to_affinity3D(dist,
+                                                  rays=rays,
+                                                  weights=prob >= affinity_thresh,
+                                                  grid=self.config.grid,
+                                                  normed=True, verbose=True);
 
+                ws_potential = zoom(np.mean(aff, -1) * prob,
+                                    zoom_factor, order=1)
+                mask = ws_potential > affinity_thresh
+                # markers      = np.zeros(img_shape, np.int32)
+                # markers[points[:,0],points[:,1],points[:,2]] = np.arange(len(points))+1
+                markers = polyhedron_to_label(disti, points, rays=rays, prob=probi,
+                                              shape=img_shape, overlap_label=overlap_label,
+                                              verbose=verbose)
+
+                labels = watershed(-ws_potential, markers=markers, mask=mask)
+
+            else:
+                labels = polyhedron_to_label(disti, points, rays=rays, prob=probi,
+                                             shape=img_shape, overlap_label=overlap_label,
+                                             verbose=verbose)
             # map the overlap_label to something positive and back
             # (as relabel_sequential doesn't like negative values)
             if overlap_label is not None and overlap_label<0 and (overlap_label in labels):
