@@ -623,7 +623,7 @@ class StarDistBase(BaseModel):
 
 
     def _predict_instances_generator(self, img, axes=None, normalizer=None,
-                                     sparse=True,
+                                     sparse=None,
                                      prob_thresh=None, nms_thresh=None,
                                      scale=None,
                                      n_tiles=None, show_tile_progress=True,
