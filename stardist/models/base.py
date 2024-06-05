@@ -317,11 +317,11 @@ class StarDistBase(BaseModel):
             return masked_metric_mse(dist_mask)(dist_true, dist_pred)
 
 
-        if self._is_multiclass():
-            prob_class_loss = weighted_categorical_crossentropy(self.config.train_class_weights, ndim=self.config.n_dim)
-            loss = [prob_loss, dist_loss, prob_class_loss]
-        else:
-            loss = [prob_loss, dist_loss]
+        # if self._is_multiclass():
+        #     prob_class_loss = weighted_categorical_crossentropy(self.config.train_class_weights, ndim=self.config.n_dim)
+        #     loss = [prob_loss, dist_loss, prob_class_loss]
+        # else:
+        loss = [prob_loss, dist_loss]
 
         self.keras_model.compile(optimizer, loss         = loss,
                                             loss_weights = list(self.config.train_loss_weights),
@@ -467,11 +467,11 @@ class StarDistBase(BaseModel):
 
             prob = create_empty_output(1)
             dist = create_empty_output(self.config.n_rays)
-            if self._is_multiclass():
-                prob_class = create_empty_output(self.config.n_classes+1)
-                result = (prob, dist, prob_class)
-            else:
-                result = (prob, dist)
+            # if self._is_multiclass():
+            #     prob_class = create_empty_output(self.config.n_classes+1)
+            #     result = (prob, dist, prob_class)
+            # else:
+            result = (prob, dist)
 
             for tile, s_src, s_dst in tile_generator:
                 # predict_direct -> prob, dist, [prob_class if multi_class]
@@ -501,9 +501,9 @@ class StarDistBase(BaseModel):
         result[1] = np.maximum(1e-3, result[1]) # avoid small dist values to prevent problems with Qhull
         result[1] = np.moveaxis(result[1],channel,-1)
 
-        if self._is_multiclass():
-            # prob_class
-            result[2] = np.moveaxis(result[2],channel,-1)
+        # if self._is_multiclass():
+        #     # prob_class
+        #     result[2] = np.moveaxis(result[2],channel,-1)
 
         # last "yield" is the actual output that would have been "return"ed if this was a regular function
         yield tuple(result)
@@ -572,10 +572,10 @@ class StarDistBase(BaseModel):
                 _points = _points * np.array(self.config.grid).reshape((1,len(self.config.grid)))
                 pointsa.extend(_points)
 
-                if self._is_multiclass():
-                    p = results_tile[2][s_src].copy()
-                    p = np.moveaxis(p,channel,-1)
-                    prob_classa.extend(p[inds])
+                # if self._is_multiclass():
+                #     p = results_tile[2][s_src].copy()
+                #     p = np.moveaxis(p,channel,-1)
+                #     prob_classa.extend(p[inds])
                 yield  # yield None after each processed tile
 
         else:
@@ -589,9 +589,9 @@ class StarDistBase(BaseModel):
             _points = np.stack(np.where(inds), axis=1)
             pointsa = (_points * np.array(self.config.grid).reshape((1,len(self.config.grid))))
 
-            if self._is_multiclass():
-                p = np.moveaxis(results[2],channel,-1)
-                prob_classa = p[inds].copy()
+            # if self._is_multiclass():
+            #     p = np.moveaxis(results[2],channel,-1)
+            #     prob_classa = p[inds].copy()
 
 
         proba = np.asarray(proba)
@@ -604,13 +604,13 @@ class StarDistBase(BaseModel):
         pointsa = pointsa[idx]
 
         # last "yield" is the actual output that would have been "return"ed if this was a regular function
-        if self._is_multiclass():
-            prob_classa = np.asarray(prob_classa).reshape((-1,self.config.n_classes+1))
-            prob_classa = prob_classa[idx]
-            yield proba, dista, prob_classa, pointsa
-        else:
-            prob_classa = None
-            yield proba, dista, pointsa
+        # if self._is_multiclass():
+        #     prob_classa = np.asarray(prob_classa).reshape((-1,self.config.n_classes+1))
+        #     prob_classa = prob_classa[idx]
+        #     yield proba, dista, prob_classa, pointsa
+        # else:
+        prob_classa = None
+        yield proba, dista, pointsa
 
 
     @functools.wraps(_predict_sparse_generator)
@@ -733,11 +733,11 @@ class StarDistBase(BaseModel):
                     yield 'tile'  # yield 'tile' each time a tile has been processed
             res = tuple(res) + (None,)
 
-        if self._is_multiclass():
-            prob, dist, prob_class, points = res
-        else:
-            prob, dist, points = res
-            prob_class = None
+        # if self._is_multiclass():
+        #     prob, dist, prob_class, points = res
+        # else:
+        prob, dist, points = res
+        prob_class = None
 
         yield 'nms'  # indicate that non-maximum suppression is starting
         res_instances = self._instances_from_prediction(_shape_inst, prob, dist,
@@ -1070,8 +1070,8 @@ class StarDistBase(BaseModel):
         if self.basedir is None and fname is None:
             raise ValueError("Need explicit 'fname', since model directory not available (basedir=None).")
 
-        if self._is_multiclass():
-            warnings.warn("multi-class mode not supported yet, removing classification output from exported model")
+        # if self._is_multiclass():
+        #     warnings.warn("multi-class mode not supported yet, removing classification output from exported model")
 
         grid = self.config.grid
         prob = self.keras_model.outputs[0]
