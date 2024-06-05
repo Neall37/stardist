@@ -388,17 +388,17 @@ class StarDist3D(StarDistBase):
         output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(unet)
 
         # attach extra classification head when self.n_classes is given
-        if self._is_multiclass():
-            if self.config.net_conv_after_unet > 0:
-                unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
-                                     name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
-            else:
-                unet_class  = unet_base
-
-            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
-            return Model([input_img], [output_prob,output_dist,output_prob_class])
-        else:
-            return Model([input_img], [output_prob,output_dist])
+        # if self._is_multiclass():
+        #     if self.config.net_conv_after_unet > 0:
+        #         unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+        #                              name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
+        #     else:
+        #         unet_class  = unet_base
+        #
+        #     output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
+        #     return Model([input_img], [output_prob,output_dist,output_prob_class])
+        # else:
+        return Model([input_img], [output_prob,output_dist])
 
 
     def _build_resnet(self):

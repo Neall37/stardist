@@ -27,7 +27,8 @@ from csbdeep.data import Resizer
 
 from ..sample_patches import get_valid_inds
 from ..nms import _ind_prob_thresh
-from ..utils import _is_power_of_2,  _is_floatarray, optimize_threshold, grid_divisible_patch_size
+from ..utils import _is_power_of_2, _is_floatarray, optimize_threshold, grid_divisible_patch_size
+from ..affinity import max_sparsify
 
 # TODO: helper function to check if receptive field of cnn is sufficient for object sizes in GT
 
@@ -229,7 +230,7 @@ class StarDistBase(BaseModel):
 
     def __init__(self, config, name=None, basedir='.'):
         super().__init__(config=config, name=name, basedir=basedir)
-        threshs = dict(prob=None, nms=None)
+        threshs = dict(prob=None, nms=None, affinity=None)
         if basedir is not None:
             try:
                 threshs = load_json(str(self.logdir / 'thresholds.json'))
@@ -240,48 +241,27 @@ class StarDistBase(BaseModel):
                 if threshs.get('nms') is None or not (0 < threshs.get('nms') < 1):
                     print("- Invalid 'nms' threshold (%s), using default value." % str(threshs.get('nms')))
                     threshs['nms'] = None
+                if threshs.get('affinity') is None :
+                    print("- Invalid 'affinity' threshold (%s), using default value." % str(threshs.get('affinity')))
+                    threshs['affinity'] = None
+
             except FileNotFoundError:
                 if config is None and len(tuple(self.logdir.glob('*.h5'))) > 0:
                     print("Couldn't load thresholds from 'thresholds.json', using default values. "
                           "(Call 'optimize_thresholds' to change that.)")
 
         self.thresholds = dict (
-            prob = 0.5 if threshs['prob'] is None else threshs['prob'],
-            nms  = 0.4 if threshs['nms']  is None else threshs['nms'],
+            prob     = 0.5 if threshs['prob'] is None else threshs['prob'],
+            nms      = 0.4 if threshs['nms']  is None else threshs['nms'],
+            affinity = 0.1 if threshs['affinity'] is None else threshs['affinity'],
         )
-        print("Using default values: prob_thresh={prob:g}, nms_thresh={nms:g}.".format(prob=self.thresholds.prob, nms=self.thresholds.nms))
+        print("Using default values: prob_thresh={prob:g}, nms_thresh={nms:g}, affinity_thresh={affinity}.".format(prob=self.thresholds.prob, nms=self.thresholds.nms, affinity=self.thresholds.affinity))
 
 
     @property
     def thresholds(self):
         return self._thresholds
 
-    def _is_multiclass(self):
-        return (self.config.n_classes is not None)
-
-    def _parse_classes_arg(self, classes, length):
-        """ creates a proper classes tuple from different possible "classes" arguments in model.train()
-
-        classes can be
-          "auto" -> all objects will be assigned to the first foreground class (unless n_classes is None)
-          single integer -> all objects will be assigned that class
-          tuple, list, ndarray -> do nothing (needs to be of given length)
-
-        returns a tuple of given length
-        """
-        if isinstance(classes, str):
-            classes == "auto" or _raise(ValueError(f"classes = '{classes}': only 'auto' supported as string argument for classes"))
-            if self.config.n_classes is None:
-                classes = None
-            elif self.config.n_classes == 1:
-                classes = (1,)*length
-            else:
-                raise ValueError("using classes = 'auto' for n_classes > 1 not supported")
-        elif isinstance(classes, (tuple, list, np.ndarray)):
-            len(classes) == length or _raise(ValueError(f"len(classes) should be {length}!"))
-        else:
-            raise ValueError("classes should either be 'auto' or a list of scalars/label dicts")
-        return classes
 
     @thresholds.setter
     def thresholds(self, d):
@@ -650,7 +630,8 @@ class StarDistBase(BaseModel):
                                      verbose=False,
                                      return_labels=True,
                                      predict_kwargs=None, nms_kwargs=None,
-                                     overlap_label=None, return_predict=False):
+                                     overlap_label=None, return_predict=False,
+                                     affinity=False, affinity_thresh=None):
         """Predict instance segmentation from input image.
 
         Parameters
@@ -698,6 +679,10 @@ class StarDistBase(BaseModel):
         return_predict: bool
             Also return the outputs of :func:`predict` (in a separate tuple)
             If True, implies sparse = False
+        affinity: bool
+            If set, refine output labels with affinity
+        affinity_thresh: float
+            Threshold parameter for refinement (affinity watershed threshold)
 
         Returns
         -------
@@ -763,6 +748,8 @@ class StarDistBase(BaseModel):
                                                         scale=(None if scale is None else dict(zip(_axes,scale))),
                                                         return_labels=return_labels,
                                                         overlap_label=overlap_label,
+                                                        affinity=affinity,
+                                                        affinity_thresh=affinity_thresh,
                                                         **nms_kwargs)
 
         # last "yield" is the actual output that would have been "return"ed if this was a regular function
@@ -788,51 +775,6 @@ class StarDistBase(BaseModel):
         for r in self._predict_instances_generator(*args, **kwargs):
             pass
         return r
-
-
-    # def _predict_instances_old(self, img, axes=None, normalizer=None,
-    #                       sparse = False,
-    #                       prob_thresh=None, nms_thresh=None,
-    #                       n_tiles=None, show_tile_progress=True,
-    #                       verbose = False,
-    #                       predict_kwargs=None, nms_kwargs=None, overlap_label=None):
-    #     """
-    #     old version, should be removed....
-    #     """
-    #     if predict_kwargs is None:
-    #         predict_kwargs = {}
-    #     if nms_kwargs is None:
-    #         nms_kwargs = {}
-
-    #     nms_kwargs.setdefault("verbose", verbose)
-
-    #     _axes         = self._normalize_axes(img, axes)
-    #     _axes_net     = self.config.axes
-    #     _permute_axes = self._make_permute_axes(_axes, _axes_net)
-    #     _shape_inst   = tuple(s for s,a in zip(_permute_axes(img).shape, _axes_net) if a != 'C')
-
-
-    #     res = self.predict(img, axes=axes, normalizer=normalizer,
-    #                                   n_tiles=n_tiles,
-    #                                   show_tile_progress=show_tile_progress,
-    #                                   **predict_kwargs)
-
-    #     res = tuple(res) + (None,)
-
-    #     if self._is_multiclass():
-    #         prob, dist, prob_class, points = res
-    #     else:
-    #         prob, dist, points = res
-    #         prob_class = None
-
-
-    #     return self._instances_from_prediction_old(_shape_inst, prob, dist,
-    #                                            points = points,
-    #                                            prob_class = prob_class,
-    #                                            prob_thresh=prob_thresh,
-    #                                            nms_thresh=nms_thresh,
-    #                                            overlap_label=overlap_label,
-    #                                            **nms_kwargs)
 
 
     def predict_instances_big(self, img, axes, block_size, min_overlap, context=None,
@@ -981,7 +923,6 @@ class StarDistBase(BaseModel):
         #     repaint_labels(labels_out, problem_ids, polys_all, show_progress=False)
 
         return labels_out, polys_all#, tuple(problem_ids)
-
 
     def optimize_thresholds(self, X_val, Y_val, nms_threshs=[0.3,0.4,0.5], iou_threshs=[0.3,0.5,0.7], predict_kwargs=None, optimize_kwargs=None, save_to_json=True):
         """Optimize two thresholds (probability, NMS overlap) necessary for predicting object instances.
