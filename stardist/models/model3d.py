@@ -388,17 +388,17 @@ class StarDist3D(StarDistBase):
         output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(unet)
 
         # attach extra classification head when self.n_classes is given
-        # if self._is_multiclass():
-        #     if self.config.net_conv_after_unet > 0:
-        #         unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
-        #                              name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
-        #     else:
-        #         unet_class  = unet_base
-        #
-        #     output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
-        #     return Model([input_img], [output_prob,output_dist,output_prob_class])
-        # else:
-        return Model([input_img], [output_prob,output_dist])
+        if self._is_multiclass():
+            if self.config.net_conv_after_unet > 0:
+                unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+                                     name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
+            else:
+                unet_class  = unet_base
+
+            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
+            return Model([input_img], [output_prob,output_dist,output_prob_class])
+        else:
+            return Model([input_img], [output_prob,output_dist])
 
 
     def _build_resnet(self):
@@ -436,17 +436,17 @@ class StarDist3D(StarDistBase):
         output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(layer)
 
         # attach extra classification head when self.n_classes is given
-        # if self._is_multiclass():
-        #     if self.config.net_conv_after_resnet > 0:
-        #         layer_class  = Conv3D(self.config.net_conv_after_resnet, self.config.resnet_kernel_size,
-        #                               name='features_class', padding='same', activation=self.config.resnet_activation)(layer_base)
-        #     else:
-        #         layer_class  = layer_base
-        #
-        #     output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(layer_class)
-        #     return Model([input_img], [output_prob,output_dist,output_prob_class])
-        # else:
-        return Model([input_img], [output_prob,output_dist])
+        if self._is_multiclass():
+            if self.config.net_conv_after_resnet > 0:
+                layer_class  = Conv3D(self.config.net_conv_after_resnet, self.config.resnet_kernel_size,
+                                      name='features_class', padding='same', activation=self.config.resnet_activation)(layer_base)
+            else:
+                layer_class  = layer_base
+
+            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(layer_class)
+            return Model([input_img], [output_prob,output_dist,output_prob_class])
+        else:
+            return Model([input_img], [output_prob,output_dist])
 
 
     def train(self, X, Y, validation_data, classes='auto', augmenter=None, seed=None, epochs=None, steps_per_epoch=None, workers=1):
@@ -499,14 +499,14 @@ class StarDist3D(StarDistBase):
 
         classes = self._parse_classes_arg(classes, len(X))
 
-        # if not self._is_multiclass() and classes is not None:
-        #     warnings.warn("Ignoring given classes as n_classes is set to None")
+        if not self._is_multiclass() and classes is not None:
+            warnings.warn("Ignoring given classes as n_classes is set to None")
 
         isinstance(validation_data,(list,tuple)) or _raise(ValueError())
-        # # if self._is_multiclass() and len(validation_data) == 2:
-        # #     validation_data = tuple(validation_data) + ('auto',)
-        # ((len(validation_data) == (3 if self._is_multiclass() else 2))
-        #     or _raise(ValueError(f'len(validation_data) = {len(validation_data)}, but should be {3 if self._is_multiclass() else 2}')))
+        if self._is_multiclass() and len(validation_data) == 2:
+            validation_data = tuple(validation_data) + ('auto',)
+        ((len(validation_data) == (3 if self._is_multiclass() else 2))
+            or _raise(ValueError(f'len(validation_data) = {len(validation_data)}, but should be {3 if self._is_multiclass() else 2}')))
 
         patch_size = self.config.train_patch_size
         axes = self.config.axes.replace('C','')
@@ -559,10 +559,10 @@ class StarDist3D(StarDistBase):
             # show dist for three rays
             _n = min(3, self.config.n_rays)
             output_slices[1][1+channel] = slice(0,(self.config.n_rays//_n)*_n, self.config.n_rays//_n)
-            # if self._is_multiclass():
-            #     _n = min(3, self.config.n_classes)
-            #     output_slices += [[slice(None)]*5]
-            #     output_slices[2][1+channel] = slice(1,1+(self.config.n_classes//_n)*_n, self.config.n_classes//_n)
+            if self._is_multiclass():
+                _n = min(3, self.config.n_classes)
+                output_slices += [[slice(None)]*5]
+                output_slices[2][1+channel] = slice(1,1+(self.config.n_classes//_n)*_n, self.config.n_classes//_n)
 
             if IS_TF_1:
                 for cb in self.callbacks:
