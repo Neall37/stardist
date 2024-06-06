@@ -670,7 +670,7 @@ class StarDist3D(StarDistBase):
         else:
             labels = None
 
-        res_dict = dict(dist=disti, points=points, prob=probi, rays=rays, rays_vertices=rays.vertices, rays_faces=rays.faces)
+        res_dict = dict(dist=disti, markers=markers, points=points, prob=probi, rays=rays, rays_vertices=rays.vertices, rays_faces=rays.faces)
 
         if prob_class is not None:
             # build the list of class ids per label via majority vote
