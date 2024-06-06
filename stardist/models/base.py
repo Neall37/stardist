@@ -772,14 +772,12 @@ class StarDistBase(BaseModel):
             for res in self._predict_sparse_generator(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
                                                       prob_thresh=prob_thresh, show_tile_progress=show_tile_progress,
                                                       **predict_kwargs):
-                print("reshape", res[1].shape)
                 if res is None:
                     yield 'tile'  # yield 'tile' each time a tile has been processed
         else:
             for res in self._predict_generator(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
                                                show_tile_progress=show_tile_progress, **predict_kwargs):
                 if res is None:
-                    print("reshape", res.shape)
                     yield 'tile'  # yield 'tile' each time a tile has been processed
             res = tuple(res) + (None,)
         # print("res:", res)
