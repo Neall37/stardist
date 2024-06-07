@@ -24,7 +24,6 @@ from ..matching import relabel_sequential
 from ..geometry import star_dist3D, polyhedron_to_label
 from ..rays3d import Rays_GoldenSpiral, rays_from_json
 from ..nms import non_maximum_suppression_3d, non_maximum_suppression_3d_sparse
-from ..nms_parallel import NMS_3d_parallel
 from ..affinity import dist_to_affinity3D, max_sparsify
 from skimage.segmentation import watershed
 
@@ -589,7 +588,7 @@ class StarDist3D(StarDistBase):
         return history
 
 
-    def _instances_from_prediction(self, img_shape, prob, dist, parallel=True, points=None, prob_class=None, prob_thresh=None, nms_thresh=None, overlap_label=None, return_labels=True, scale=None,  affinity=False, affinity_thresh=None,**nms_kwargs):
+    def _instances_from_prediction(self, img_shape, prob, dist, points=None, prob_class=None, prob_thresh=None, nms_thresh=None, overlap_label=None, return_labels=True, scale=None,  affinity=False, affinity_thresh=None,**nms_kwargs):
         """
         if points is None     -> dense prediction
         if points is not None -> sparse prediction
@@ -610,12 +609,7 @@ class StarDist3D(StarDistBase):
 
         # dense prediction
         else:
-            if parallel:
-                points, probi, disti = NMS_3d_parallel(dist, prob, rays, grid=self.config.grid,
-                                                                  prob_thresh=prob_thresh, nms_thresh=nms_thresh,
-                                                                  **nms_kwargs)
-            else:
-                points, probi, disti = non_maximum_suppression_3d(dist, prob, rays, grid=self.config.grid,
+            points, probi, disti = non_maximum_suppression_3d(dist, prob, rays, grid=self.config.grid,
                                                               prob_thresh=prob_thresh, nms_thresh=nms_thresh, **nms_kwargs)
             if prob_class is not None:
                 inds = tuple(p//g for p,g in zip(points.T, self.config.grid))

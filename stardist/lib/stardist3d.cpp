@@ -43,7 +43,7 @@ static PyObject* c_non_max_suppression_inds(PyObject *self, PyObject *args) {
   const int * const faces = (int*) PyArray_DATA(arr_faces);
   const float * const scores = (float*) PyArray_DATA(arr_scores);
 
-  
+
   npy_intp dims_result[1];
   dims_result[0] = n_polys;
   arr_result = (PyArrayObject*)PyArray_SimpleNew(1,dims_result,NPY_BOOL);
@@ -52,14 +52,15 @@ static PyObject* c_non_max_suppression_inds(PyObject *self, PyObject *args) {
 
 
   _COMMON_non_maximum_suppression_sparse(scores,dist, points,
-                                         n_polys, n_rays, n_faces, 
+                                         n_polys, n_rays, n_faces,
                                          verts, faces,
-                                         threshold, use_bbox, use_kdtree, verbose, 
+                                         threshold, use_bbox, use_kdtree, verbose,
                                          result);
-  
+
 
   return PyArray_Return(arr_result);
 }
+
 
 
 
