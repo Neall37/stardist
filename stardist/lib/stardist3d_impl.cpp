@@ -952,46 +952,41 @@ float diff_time(const std::chrono::time_point<std::chrono::high_resolution_clock
 // faces.shape = (n_faces, 3)
 // expects that polys are sorted with associated descending scores
 // returns boolean vector of polys indices that are kept
+#include <cstdio>
+#include <csignal>
+#include <omp.h>#include <cstdlib>
 
 void _COMMON_non_maximum_suppression_sparse(
                     const float* scores, const float* dist, const float* points,
                     const int n_polys, const int n_rays, const int n_faces, 
                     const float* verts, const int* faces,
-                    const float threshold, const int use_bbox, const int use_kdtree, 
-                    const int verbose, 
+                    const float threshold, const int use_bbox, const int use_kdtree, const int verbose,
                     bool* result)
 {
-  // set SIGINT handler to react on Ctrl-C
-  sighandler_t old_sigint_handler = signal(SIGINT, my_signal_handler);
-  
-  if (verbose){
-    printf("Non Maximum Suppression (3D) ++++ \n");
-    printf("NMS: n_polys  = %d \nNMS: n_rays   = %d  \nNMS: n_faces  = %d \nNMS: thresh   = %.3f \nNMS: use_bbox = %d \nNMS: use_kdtree = %d \n", n_polys, n_rays, n_faces, threshold, use_bbox, use_kdtree);
+    // set SIGINT handler to react on Ctrl-C
+    sighandler_t old_sigint_handler = signal(SIGINT, my_signal_handler);
 
-int main() {
-    #ifdef _OPENMP
-    // Set the number of threads higher
-    int n_threads = (argc > 1) ? atoi(argv[1]) : omp_get_num_procs();
-    omp_set_num_threads(n_threads);
-
-    // Start a parallel region
-    #pragma omp parallel
-    {
-        // Only one thread prints this at a time
-        #pragma omp critical
-        {
-            printf("NMS: using OpenMP with %d thread(s)\n", omp_get_max_threads());
-        }
+    int n_threads = omp_get_max_threads(); // Default to max threads
+#ifdef _OPENMP
+    // Determine the number of threads
+    if (n_threads <= 1) {
+        n_threads = omp_get_num_procs(); // Automatically detect the number of processors if n_threads is 1
     }
-    #else
-    printf("OpenMP is not supported.\n");
-    #endif
-    return 0;
-}
-
+    omp_set_num_threads(n_threads);
 #endif
-    fflush(stdout);
+
+    if (verbose) {
+        printf("Non Maximum Suppression (3D) ++++ \n");
+        printf("NMS: n_polys  = %d \nNMS: n_rays   = %d  \nNMS: n_faces  = %d \nNMS: thresh   = %.3f \nNMS: use_bbox = %d \nNMS: use_kdtree = %d \n",
+               n_polys, n_rays, n_faces, threshold, use_bbox, use_kdtree);
+#ifdef _OPENMP
+        printf("NMS: using OpenMP with %d thread(s)\n", n_threads);
+#endif
+        fflush(stdout);
   }
+
+
+
 
   float * volumes = new float[n_polys];
   float * radius_inner = new float[n_polys];
