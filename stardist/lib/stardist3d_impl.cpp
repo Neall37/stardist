@@ -967,8 +967,28 @@ void _COMMON_non_maximum_suppression_sparse(
   if (verbose){
     printf("Non Maximum Suppression (3D) ++++ \n");
     printf("NMS: n_polys  = %d \nNMS: n_rays   = %d  \nNMS: n_faces  = %d \nNMS: thresh   = %.3f \nNMS: use_bbox = %d \nNMS: use_kdtree = %d \n", n_polys, n_rays, n_faces, threshold, use_bbox, use_kdtree);
-#ifdef _OPENMP
-    printf("NMS: using OpenMP with %d thread(s)\n", omp_get_max_threads());
+
+int main() {
+    #ifdef _OPENMP
+    // Set the number of threads higher
+    int n_threads = (argc > 1) ? atoi(argv[1]) : omp_get_num_procs();
+    omp_set_num_threads(n_threads);
+
+    // Start a parallel region
+    #pragma omp parallel
+    {
+        // Only one thread prints this at a time
+        #pragma omp critical
+        {
+            printf("NMS: using OpenMP with %d thread(s)\n", omp_get_max_threads());
+        }
+    }
+    #else
+    printf("OpenMP is not supported.\n");
+    #endif
+    return 0;
+}
+
 #endif
     fflush(stdout);
   }

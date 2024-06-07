@@ -5,6 +5,7 @@ import sys
 import warnings
 import math
 from tqdm import tqdm
+from multiprocessing import Pool, Manager, cpu_count
 from collections import namedtuple
 from pathlib import Path
 import threading
@@ -972,6 +973,183 @@ class StarDistBase(BaseModel):
         #     repaint_labels(labels_out, problem_ids, polys_all, show_progress=False)
 
         return labels_out, polys_all  # , tuple(problem_ids)
+
+
+    def process_block(self, args):
+        from ..matching import relabel_sequential
+        idx, block, img, axes, axes_out, label_offset, kwargs = args
+        labels, polys = block.predict_instances(block.read(img, axes=axes), **kwargs)
+        labels = block.crop_context(labels, axes=axes_out)
+        labels, polys = block.filter_objects(labels, polys, axes=axes_out)
+        labels = relabel_sequential(labels, label_offset)[0]
+
+        result = {
+            "idx": idx,
+            "labels": labels,
+            "polys": polys,
+            "label_offset": len(polys['prob'])
+        }
+        return result
+
+    def parallel_block_processing(self, labels_out, blocks, img, axes, axes_out, label_offset=0, show_progress=False, **kwargs):
+        from ..big import OBJECT_KEYS
+        manager = Manager()
+        polys_all = manager.dict()
+        blocks = list(blocks)  # Convert tqdm object to list for parallel processing
+
+        # Prepare tasks for parallel processing with index
+        tasks = [(i, block, img, axes, axes_out, label_offset, kwargs) for i, block in enumerate(blocks)]
+
+        with Pool(processes=cpu_count()) as pool:
+            results = list(tqdm(pool.imap(self.process_block, tasks), total=len(tasks), disable=(not show_progress)))
+
+        # Sort results by original index to maintain order
+        results.sort(key=lambda x: x["idx"])
+
+        # Aggregate results and update label_offset correctly
+        for result in results:
+            labels = result["labels"]
+            polys = result["polys"]
+            offset = result["label_offset"]
+
+            if labels_out is not None:
+                blocks[result["idx"]].write(labels_out, labels, axes=axes_out)
+
+            for k, v in polys.items():
+                if k in polys_all:
+                    polys_all[k].append(v)
+                else:
+                    polys_all[k] = [v]
+
+            label_offset += offset
+
+        # Concatenate results
+        polys_all = {k: (np.concatenate(v) if k in OBJECT_KEYS else v[0]) for k, v in polys_all.items()}
+
+        # if labels_out is not None and len(problem_ids) > 0:
+        #     repaint_labels(labels_out, problem_ids, polys_all, show_progress=False)
+
+        return labels_out, polys_all  # , tuple(problem_ids)
+
+    def predict_instances_big_parallel(self, img, axes, block_size, min_overlap, context=None,
+                              labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
+        """Predict instance segmentation from very large input images.
+
+        Intended to be used when `predict_instances` cannot be used due to memory limitations.
+        This function will break the input image into blocks and process them individually
+        via `predict_instances` and assemble all the partial results. If used as intended, the result
+        should be the same as if `predict_instances` was used directly on the whole image.
+
+        **Important**: The crucial assumption is that all predicted object instances are smaller than
+                       the provided `min_overlap`. Also, it must hold that: min_overlap + 2*context < block_size.
+
+        Example
+        -------
+        >>> img.shape
+        (20000, 20000)
+        >>> labels, polys = model.predict_instances_big(img, axes='YX', block_size=4096,
+                                                        min_overlap=128, context=128, n_tiles=(4,4))
+
+        Parameters
+        ----------
+        img: :class:`numpy.ndarray` or similar
+            Input image
+        axes: str
+            Axes of the input ``img`` (such as 'YX', 'ZYX', 'YXC', etc.)
+        block_size: int or iterable of int
+            Process input image in blocks of the provided shape.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        min_overlap: int or iterable of int
+            Amount of guaranteed overlap between blocks.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        context: int or iterable of int, or None
+            Amount of image context on all sides of a block, which is discarded.
+            If None, uses an automatic estimate that should work in many cases.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        labels_out: :class:`numpy.ndarray` or similar, or None, or False
+            numpy array or similar (must be of correct shape) to which the label image is written.
+            If None, will allocate a numpy array of the correct shape and data type ``labels_out_dtype``.
+            If False, will not write the label image (useful if only the dictionary is needed).
+        labels_out_dtype: str or dtype
+            Data type of returned label image if ``labels_out=None`` (has no effect otherwise).
+        show_progress: bool
+            Show progress bar for block processing.
+        kwargs: dict
+            Keyword arguments for ``predict_instances``.
+
+        Returns
+        -------
+        (:class:`numpy.ndarray` or False, dict)
+            Returns the label image and a dictionary with the details (coordinates, etc.) of the polygons/polyhedra.
+
+        """
+        from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # , repaint_labels
+
+
+        n = img.ndim
+        axes = axes_check_and_normalize(axes, length=n)
+        grid = self._axes_div_by(axes)
+        axes_out = self._axes_out.replace('C', '')
+        shape_dict = dict(zip(axes, img.shape))
+        shape_out = tuple(shape_dict[a] for a in axes_out)
+
+        if context is None:
+            context = self._axes_tile_overlap(axes)
+
+        if np.isscalar(block_size):  block_size = n * [block_size]
+        if np.isscalar(min_overlap): min_overlap = n * [min_overlap]
+        if np.isscalar(context):     context = n * [context]
+        block_size, min_overlap, context = list(block_size), list(min_overlap), list(context)
+        assert n == len(block_size) == len(min_overlap) == len(context)
+
+        if 'C' in axes:
+            # single block for channel axis
+            i = axes_dict(axes)['C']
+            # if (block_size[i], min_overlap[i], context[i]) != (None, None, None):
+            #     print("Ignoring values of 'block_size', 'min_overlap', and 'context' for channel axis " +
+            #           "(set to 'None' to avoid this warning).", file=sys.stderr, flush=True)
+            block_size[i] = img.shape[i]
+            min_overlap[i] = context[i] = 0
+
+        block_size = tuple(
+            _grid_divisible(g, v, name='block_size', verbose=False) for v, g, a in zip(block_size, grid, axes))
+        min_overlap = tuple(
+            _grid_divisible(g, v, name='min_overlap', verbose=False) for v, g, a in zip(min_overlap, grid, axes))
+        context = tuple(_grid_divisible(g, v, name='context', verbose=False) for v, g, a in zip(context, grid, axes))
+
+        # print(f"input: shape {img.shape} with axes {axes}")
+        print(f'effective: block_size={block_size}, min_overlap={min_overlap}, context={context}', flush=True)
+
+        for a, c, o in zip(axes, context, self._axes_tile_overlap(axes)):
+            if c < o:
+                print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
+
+        # create block cover
+        blocks = BlockND.cover(img.shape, axes, block_size, min_overlap, context, grid)
+
+        if np.isscalar(labels_out) and bool(labels_out) is False:
+            labels_out = None
+        else:
+            if labels_out is None:
+                labels_out = np.zeros(shape_out, dtype=labels_out_dtype)
+            else:
+                labels_out.shape == shape_out or _raise(
+                    ValueError(f"'labels_out' must have shape {shape_out} (axes {axes_out})."))
+
+        polys_all = {}
+        # problem_ids = []
+        label_offset = 1
+
+        kwargs_override = dict(axes=axes, overlap_label=None, return_labels=True, return_predict=False)
+        if show_progress:
+            kwargs_override['show_tile_progress'] = False  # disable progress for predict_instances
+        for k, v in kwargs_override.items():
+            if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
+            kwargs[k] = v
+        labels_out, polys_all = self.parallel_block_processing(labels_out, blocks, img, axes, axes_out, label_offset=0,
+                                                          show_progress=True, **kwargs)
+
+
 
     def optimize_thresholds(self, X_val, Y_val, nms_threshs=[0.3, 0.4, 0.5], iou_threshs=[0.3, 0.5, 0.7],
                             predict_kwargs=None, optimize_kwargs=None, save_to_json=True):
