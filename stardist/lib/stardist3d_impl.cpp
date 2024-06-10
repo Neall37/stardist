@@ -1431,6 +1431,14 @@ void  _COMMON_polyhedron_to_label(const float* dist, const float* points,
   // set SIGINT handler to react on Ctrl-C
   sighandler_t old_sigint_handler = signal(SIGINT, my_signal_handler);
 
+   int n_threads = omp_get_max_threads(); // Default to max threads
+#ifdef _OPENMP
+    // Determine the number of threads
+    if (n_threads <= 1) {
+        n_threads = omp_get_num_procs(); // Automatically detect the number of processors if n_threads is 1
+    }
+    omp_set_num_threads(n_threads);
+#endif
   
   if (verbose>=1){
     printf("+++++++++++++++ polyhedra to label +++++++++++++++ \n");
@@ -1440,6 +1448,7 @@ void  _COMMON_polyhedron_to_label(const float* dist, const float* points,
     printf("nz, ny, nx        = %d %d %d \n", nz,ny,nx);
     printf("use_overlap_label = %d \n", use_overlap_label);
     printf("overlap_label     = %d \n", overlap_label);
+    printf("Using OpenMP with %d thread(s)\n", n_threads);
     fflush(stdout);
   }
 
