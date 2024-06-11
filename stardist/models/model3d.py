@@ -587,8 +587,10 @@ class StarDist3D(StarDistBase):
 
         return history
 
-
-    def _instances_from_prediction(self, img_shape, prob, dist, points=None, prob_class=None, prob_thresh=None, nms_thresh=None, overlap_label=None, return_labels=True, scale=None,  affinity=False, affinity_thresh=None,**nms_kwargs):
+    def _instances_from_prediction(self, img_shape, prob, dist, points=None,
+                                   prob_class=None, prob_thresh=None, nms_thresh=None,
+                                   overlap_label=None, return_labels=True, scale=None,
+                                   affinity=False, affinity_thresh=None,**nms_kwargs):
         """
         if points is None     -> dense prediction
         if points is not None -> sparse prediction
