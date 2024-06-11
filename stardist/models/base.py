@@ -19,7 +19,7 @@ from csbdeep.utils.tf import export_SavedModel, keras_import, IS_TF_1, CARETenso
 import tensorflow as tf
 
 import dask
-from dask import delayed
+import dask.array as da
 from dask.distributed import Client, LocalCluster, as_completed
 
 Sequence = keras_import('utils', 'Sequence')
