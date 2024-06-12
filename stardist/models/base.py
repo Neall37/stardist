@@ -20,7 +20,7 @@ import tensorflow as tf
 
 import dask
 import dask.array as da
-from dask.distributed import Client, LocalCluster, as_completed
+from dask.distributed import Client, LocalCluster, as_completed,progress
 
 Sequence = keras_import('utils', 'Sequence')
 Adam = keras_import('optimizers', 'Adam')
@@ -791,7 +791,6 @@ class StarDistBase(BaseModel):
         else:
             prob, dist, points = res
             prob_class = None
-        print(dist.shape)
         yield 'nms'  # indicate that non-maximum suppression is starting
         res_instances = self._instances_from_prediction(_shape_inst, prob, dist,
                                                         points=points,
@@ -829,7 +828,17 @@ class StarDistBase(BaseModel):
         return r
 
     def predict_instances_block(self, block, img, **kwargs):
-        labels, polys = self.predict_instances(block.read_dask(img, axes=kwargs["axes"]), **kwargs)
+        # Get the global slice for the current block
+        # global_slice = block.slice_read(axes=kwargs["axes"])
+        # print(global_slice)
+        # print("1")
+        img_block = block.read_dask(img, axes=kwargs["axes"])
+        # Proceed with your prediction using the combined result
+        # print("2")
+        data = img_block.compute()
+        # print("3")
+        labels, polys = self.predict_instances(data, **kwargs)
+
         return labels, polys, block
 
     def process_block_sequential(self, labels, polys, block, label_offset, axes_out):
@@ -925,7 +934,7 @@ class StarDistBase(BaseModel):
             _grid_divisible(g, v, name='min_overlap', verbose=False) for v, g, a in zip(min_overlap, grid, axes))
         context = tuple(_grid_divisible(g, v, name='context', verbose=False) for v, g, a in zip(context, grid, axes))
 
-        # print(f"input: shape {img.shape} with axes {axes}")
+        # print(f"input: shape {img_shape} with axes {axes}")
         print(f'effective: block_size={block_size}, min_overlap={min_overlap}, context={context}', flush=True)
 
         for a, c, o in zip(axes, context, self._axes_tile_overlap(axes)):
@@ -934,7 +943,6 @@ class StarDistBase(BaseModel):
 
         # create block cover
         blocks = BlockND.cover(img.shape, axes, block_size, min_overlap, context, grid)
-
         num_blocks = len(blocks)
         print("The number of blocks:", num_blocks)
         if np.isscalar(labels_out) and bool(labels_out) is False:
@@ -957,30 +965,85 @@ class StarDistBase(BaseModel):
             if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
             kwargs[k] = v
 
+        def split_into_chunks(img, chunk_size):
+            chunks_img = []
+            for i in range(0, img.shape[1], chunk_size):
+                chunk = img[:, i:i + chunk_size, :]
+                chunks_img.append(chunk)
+            return chunks_img
+
+        # # Split the data into smaller chunks
+        chunk_size = 100
+        chunks = split_into_chunks(img, chunk_size)
+        # Sample chunk to define shape and dtype
+        sample = chunks[0]
+        print(sample.shape)
+
+        if sys.getsizeof(sample) > (1 * 1024 * 1024 * 1024):  # 1 GiB
+            raise ValueError(f"Chunk size is too large to be handled.")
+
+        print("Start Dask")
+        dask.config.set({'distributed.comm.max-frame-size': '500MiB'})
+
         cluster = LocalCluster(
-            n_workers=8,  # Number of workers (one per block)
-            threads_per_worker=32,  # Number of threads per worker (adjust as needed)
-            memory_limit=f'60GB'  # Memory limit per worker
+            n_workers=3,  # Number of workers (one per block)
+            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
+            memory_limit='200GB',  # Memory limit per worker
+            timeout="120s"
         )
         client = Client(cluster)
-        data = da.from_array(img, chunks=(50, 400, 400))
-        persisted_data = data.persist()
+        # print(client.dashboard_link)
 
-        # Submit the tasks as futures and keep track of their order
-        futures = [client.submit(self.predict_instances_block, block, persisted_data, **kwargs) for block in blocks]
+        lazy_arrays = [dask.delayed(chunk) for chunk in chunks]
 
-        # Create a dictionary to hold the results with their original indices
-        future_to_index = {future: idx for idx, future in enumerate(futures)}
+        # Convert each delayed chunk into a Dask array
+        lazy_dask_arrays = [
+            da.from_delayed(lazy_array, shape=sample.shape, dtype=sample.dtype)
+            for lazy_array in lazy_arrays
+        ]
 
-        # Prepare a list to hold results in the original order
-        predictions = [None] * len(futures)
+        # Stack the lazy Dask arrays into a single Dask array
+        dask_array = da.concatenate(lazy_dask_arrays, axis=1)
+        # # Scatter the chunks to Dask workers
+        print("Scattering")
+        # Scatter the Dask array to the workers
+        dask_array_future = client.scatter(dask_array)
+        print("Done Scattering")
+        # # print("Scattering")
+        # # gc.collect()
+        # # scattered_img = client.scatter(img_dask, broadcast=True)
+        # # print("Done Scattering")
+        # # Submit the tasks as futures with retries and keep track of their order
+        print("Shape of dask array: ", dask_array.shape)
 
-        # Gather results as they complete and store them in the original order
-        for future in as_completed(futures):
-            result = future.result()
-            idx = future_to_index[future]
-            predictions[idx] = result
+        # Submit tasks in batches and get predictions
+        batch_size = 100
+        futures = []
+        future_to_index = {}
+        predictions = [None] * len(blocks)
+        for i in range(0, len(blocks), batch_size):
+            batch = blocks[i:i + batch_size]
+            batch_futures = [
+                client.submit(self.predict_instances_block, block, dask_array_future, retries=3, **kwargs)
+                for block in batch
+            ]
+            futures.extend(batch_futures)
+            future_to_index.update({future: idx for idx, future in enumerate(batch_futures, start=i)})
 
+            # Use tqdm to show a progress bar for the completion of futures
+            with tqdm(total=len(batch_futures), desc=f"Processing Batch {i // batch_size + 1}") as pbar:
+                for future in as_completed(batch_futures):
+                    try:
+                        result = future.result()
+                        idx = future_to_index[future]
+                        predictions[idx] = result
+                        pbar.update(1)
+                    except Exception as e:
+                        print(f"Task failed: {e}")
+
+        # Optionally, shut down the Dask client if no longer needed
+        client.close()
+        # predictions = img_dask.map_blocks(self.predict_instances_block, dtype=float, meta=np.array(()))
         # Apply sequential operations on the results
         results = []
         for labels, polys, block in predictions:
@@ -1201,7 +1264,8 @@ class StarDistBase(BaseModel):
 
         opt_prob_thresh, opt_measure, opt_nms_thresh = None, -np.inf, None
         for _opt_nms_thresh in nms_threshs:
-            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val, Yhat_val, model=self, nms_thresh=_opt_nms_thresh,
+            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val, Yhat_val, model=self,
+                                                                nms_thresh=_opt_nms_thresh,
                                                                 iou_threshs=iou_threshs, **optimize_kwargs)
             if _opt_measure > opt_measure:
                 opt_prob_thresh, opt_measure, opt_nms_thresh = _opt_prob_thresh, _opt_measure, _opt_nms_thresh

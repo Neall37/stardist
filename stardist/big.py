@@ -317,7 +317,7 @@ class BlockND:
         return labels[self.slice_crop_context(axes)]
 
     def read_dask(self, x, axes=None):
-        return x[self.slice_read(axes)].compute()
+        return x[self.slice_read(axes)]
     def write(self, x, labels, axes=None):
         """Write (only entries > 0 of) labels to block "write region" of x (numpy.ndarray or similar)"""
         s = self.slice_write(axes)

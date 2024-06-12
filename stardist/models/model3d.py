@@ -639,7 +639,7 @@ class StarDist3D(StarDistBase):
                                                   rays=rays,
                                                   weights=prob >= affinity_thresh,
                                                   grid=self.config.grid,
-                                                  normed=True, verbose=True);
+                                                  normed=True, verbose=verbose);
 
                 ws_potential = zoom(np.mean(aff, -1) * prob,
                                     zoom_factor, order=1)
