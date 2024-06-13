@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import math
 from tqdm import tqdm
+import time
 
 
 from csbdeep.models import BaseConfig
