@@ -737,7 +737,7 @@ class StarDist3D(StarDistBase):
             class_id = np.argmax(prob_class, axis=-1)
             res_dict.update(dict(class_prob=prob_class, class_id=class_id))
 
-        return labels, res_dict, time_usage
+        return time_usage, labels, res_dict
 
 
     def _axes_div_by(self, query_axes):

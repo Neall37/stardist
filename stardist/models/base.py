@@ -18,9 +18,11 @@ from csbdeep.utils.tf import export_SavedModel, keras_import, IS_TF_1, CARETenso
 
 import tensorflow as tf
 
-import dask
+import gc
 import dask.array as da
-from dask.distributed import Client, LocalCluster, as_completed,progress
+import dask
+from dask.distributed import Client, LocalCluster, as_completed, progress
+import time
 
 Sequence = keras_import('utils', 'Sequence')
 Adam = keras_import('optimizers', 'Adam')
@@ -526,7 +528,7 @@ class StarDistBase(BaseModel):
                 result = (prob, dist, prob_class)
             else:
                 result = (prob, dist)
-
+            start_time_predict_direct = time.time()
             for tile, s_src, s_dst in tile_generator:
                 # predict_direct -> prob, dist, [prob_class if multi_class]
                 result_tile = predict_direct(tile)
@@ -546,7 +548,10 @@ class StarDistBase(BaseModel):
         else:
             # predict_direct -> prob, dist, [prob_class if multi_class]
             result = predict_direct(x)
+        end_time_predict_direct = time.time()
+        elapsed_time_predict_direct = end_time_predict_direct - start_time_predict_direct
 
+        print(f"Time taken for predict_direct: {elapsed_time_predict_direct} seconds")
         result = [resizer.after(part, axes_net) for part in result]
 
         # result = (prob, dist) for legacy or (prob, dist, prob_class) for multiclass
@@ -831,248 +836,6 @@ class StarDistBase(BaseModel):
             pass
         return r
 
-    def predict_instances_block(self, block, img, **kwargs):
-        # Get the global slice for the current block
-        # global_slice = block.slice_read(axes=kwargs["axes"])
-        # print(global_slice)
-        # print("1")
-        img_block = block.read_dask(img, axes=kwargs["axes"])
-        # Proceed with your prediction using the combined result
-        # print("2")
-        data = img_block.compute()
-        # print("3")
-        time_usage, labels, polys = self.predict_instances(data, **kwargs)
-
-        return time_usage, labels, polys, block
-
-    def process_block_sequential(self, labels, polys, block, label_offset, axes_out):
-        from ..matching import relabel_sequential
-
-        labels = block.crop_context(labels, axes=axes_out)
-        labels, polys = block.filter_objects(labels, polys, axes=axes_out)
-        labels = relabel_sequential(labels, label_offset)[0]
-        return labels, polys, block
-
-    def predict_instances_big_parallel(self, img, axes, block_size, min_overlap, context=None,
-                                       labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
-        """Predict instance segmentation from very large input images.
-
-        Intended to be used when `predict_instances` cannot be used due to memory limitations.
-        This function will break the input image into blocks and process them individually
-        via `predict_instances` and assemble all the partial results. If used as intended, the result
-        should be the same as if `predict_instances` was used directly on the whole image.
-
-        **Important**: The crucial assumption is that all predicted object instances are smaller than
-                       the provided `min_overlap`. Also, it must hold that: min_overlap + 2*context < block_size.
-
-        Example
-        -------
-        >>> img.shape
-        (20000, 20000)
-        >>> labels, polys = model.predict_instances_big(img, axes='YX', block_size=4096,
-                                                        min_overlap=128, context=128, n_tiles=(4,4))
-
-        Parameters
-        ----------
-        img: :class:`numpy.ndarray` or similar
-            Input image
-        axes: str
-            Axes of the input ``img`` (such as 'YX', 'ZYX', 'YXC', etc.)
-        block_size: int or iterable of int
-            Process input image in blocks of the provided shape.
-            (If a scalar value is given, it is used for all spatial image dimensions.)
-        min_overlap: int or iterable of int
-            Amount of guaranteed overlap between blocks.
-            (If a scalar value is given, it is used for all spatial image dimensions.)
-        context: int or iterable of int, or None
-            Amount of image context on all sides of a block, which is discarded.
-            If None, uses an automatic estimate that should work in many cases.
-            (If a scalar value is given, it is used for all spatial image dimensions.)
-        labels_out: :class:`numpy.ndarray` or similar, or None, or False
-            numpy array or similar (must be of correct shape) to which the label image is written.
-            If None, will allocate a numpy array of the correct shape and data type ``labels_out_dtype``.
-            If False, will not write the label image (useful if only the dictionary is needed).
-        labels_out_dtype: str or dtype
-            Data type of returned label image if ``labels_out=None`` (has no effect otherwise).
-        show_progress: bool
-            Show progress bar for block processing.
-        kwargs: dict
-            Keyword arguments for ``predict_instances``.
-
-        Returns
-        -------
-        (:class:`numpy.ndarray` or False, dict)
-            Returns the label image and a dictionary with the details (coordinates, etc.) of the polygons/polyhedra.
-
-        """
-        from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # , repaint_labels
-
-        n = img.ndim
-        axes = axes_check_and_normalize(axes, length=n)
-        grid = self._axes_div_by(axes)
-        axes_out = self._axes_out.replace('C', '')
-        shape_dict = dict(zip(axes, img.shape))
-        shape_out = tuple(shape_dict[a] for a in axes_out)
-
-        if context is None:
-            context = self._axes_tile_overlap(axes)
-
-        if np.isscalar(block_size):  block_size = n * [block_size]
-        if np.isscalar(min_overlap): min_overlap = n * [min_overlap]
-        if np.isscalar(context):     context = n * [context]
-        block_size, min_overlap, context = list(block_size), list(min_overlap), list(context)
-        assert n == len(block_size) == len(min_overlap) == len(context)
-
-        if 'C' in axes:
-            # single block for channel axis
-            i = axes_dict(axes)['C']
-            # if (block_size[i], min_overlap[i], context[i]) != (None, None, None):
-            #     print("Ignoring values of 'block_size', 'min_overlap', and 'context' for channel axis " +
-            #           "(set to 'None' to avoid this warning).", file=sys.stderr, flush=True)
-            block_size[i] = img.shape[i]
-            min_overlap[i] = context[i] = 0
-
-        block_size = tuple(
-            _grid_divisible(g, v, name='block_size', verbose=False) for v, g, a in zip(block_size, grid, axes))
-        min_overlap = tuple(
-            _grid_divisible(g, v, name='min_overlap', verbose=False) for v, g, a in zip(min_overlap, grid, axes))
-        context = tuple(_grid_divisible(g, v, name='context', verbose=False) for v, g, a in zip(context, grid, axes))
-
-        # print(f"input: shape {img_shape} with axes {axes}")
-        print(f'effective: block_size={block_size}, min_overlap={min_overlap}, context={context}', flush=True)
-
-        for a, c, o in zip(axes, context, self._axes_tile_overlap(axes)):
-            if c < o:
-                print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
-
-        # create block cover
-        blocks = BlockND.cover(img.shape, axes, block_size, min_overlap, context, grid)
-        num_blocks = len(blocks)
-        print("The number of blocks:", num_blocks)
-        if np.isscalar(labels_out) and bool(labels_out) is False:
-            labels_out = None
-        else:
-            if labels_out is None:
-                labels_out = np.zeros(shape_out, dtype=labels_out_dtype)
-            else:
-                labels_out.shape == shape_out or _raise(
-                    ValueError(f"'labels_out' must have shape {shape_out} (axes {axes_out})."))
-
-        polys_all = {}
-        # problem_ids = []
-        label_offset = 1
-
-        kwargs_override = dict(axes=axes, overlap_label=None, return_labels=True, return_predict=False)
-        if show_progress:
-            kwargs_override['show_tile_progress'] = False  # disable progress for predict_instances
-        for k, v in kwargs_override.items():
-            if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
-            kwargs[k] = v
-
-        print("Start Dask")
-        dask.config.set({'distributed.comm.max-frame-size': '1024MiB'})
-
-        cluster = LocalCluster(
-            n_workers=3,  # Number of workers (one per block)
-            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
-            memory_limit='200GB',  # Memory limit per worker
-            timeout="720s"
-        )
-        client = Client(cluster)
-        print(client.dashboard_link)
-
-        def split_into_chunks(img, chunk_size):
-            chunks_img = []
-            for i in range(0, img.shape[1], chunk_size):
-                chunk = img[:, i:i + chunk_size, :]
-                chunks_img.append(chunk)
-            return chunks_img
-
-        # # Split the data into smaller chunks
-        chunk_size = 100
-        chunks = split_into_chunks(img, chunk_size)
-        # Sample chunk to define shape and dtype
-        sample = chunks[0]
-        print("Sample chunk shape:", sample.shape)
-        print("Sample chunk size (bytes):", sys.getsizeof(sample))
-
-        if sys.getsizeof(sample) > (1 * 1024 * 1024 * 1024):  # 1 GiB
-            raise ValueError(f"Chunk size is too large to be handled.")
-
-        # Scatter each chunk and create futures
-        print("Scattering")
-        chunk_futures = client.scatter(chunks)
-        client.rebalance()
-        print("Done Scattering")
-
-        # Reassemble the chunks into a Dask array from the futures
-        lazy_dask_arrays = [
-            da.from_delayed(client.submit(lambda x: x, future), shape=chunk.shape, dtype=chunk.dtype)
-            for future, chunk in zip(chunk_futures, chunks)
-        ]
-
-        # Concatenate the lazy Dask arrays into a single Dask array
-        dask_array = da.concatenate(lazy_dask_arrays, axis=1)
-
-        # Persist the Dask array to keep it in memory across the workers
-
-        dask_array = dask_array.persist()
-
-        # Optionally, rebalance the cluster to ensure even data distribution
-        client.rebalance()
-        print("Done Persist")
-
-        # Submit tasks in batches and get predictions
-        batch_size = 50
-        futures = []
-        future_to_index = {}
-        predictions = [None] * len(blocks)
-        for i in range(0, len(blocks), batch_size):
-            batch = blocks[i:i + batch_size]
-            batch_futures = [
-                client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
-                for block in batch
-            ]
-            futures.extend(batch_futures)
-            future_to_index.update({future: idx for idx, future in enumerate(batch_futures, start=i)})
-
-            # Use tqdm to show a progress bar for the completion of futures
-            with tqdm(total=len(batch_futures), desc=f"Processing Batch {i // batch_size + 1}") as pbar:
-                for future in as_completed(batch_futures):
-                    try:
-                        result = future.result()
-                        idx = future_to_index[future]
-                        predictions[idx] = result
-                        pbar.update(1)
-                    except Exception as e:
-                        print(f"Task failed: {e}")
-
-        # Optionally, shut down the Dask client if no longer needed
-        client.close()
-        # predictions = img_dask.map_blocks(self.predict_instances_block, dtype=float, meta=np.array(()))
-        # Apply sequential operations on the results
-        results = []
-        time_usage_all = []
-        for time_usage, labels, polys, block in predictions:
-            labels, polys, block = self.process_block_sequential(labels, polys, block, label_offset, axes_out)
-            results.append((labels, polys, block))
-            time_usage_all.append(time_usage)
-
-            if labels_out is not None:
-                block.write(labels_out, labels, axes=axes_out)
-
-            for k, v in polys.items():
-                polys_all.setdefault(k, []).append(v)
-
-            label_offset += len(polys['prob'])
-            del labels
-
-        polys_all = {k: (np.concatenate(v) if k in OBJECT_KEYS else v[0]) for k, v in polys_all.items()}
-        time_usage_all = np.array(time_usage_all)
-        print(time_usage_all.shape)
-        return labels_out, polys_all
-
-
     def predict_instances_big(self, img, axes, block_size, min_overlap, context=None,
                               labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
         """Predict instance segmentation from very large input images.
@@ -1223,6 +986,320 @@ class StarDistBase(BaseModel):
 
         return labels_out, polys_all  # , tuple(problem_ids)
 
+    # def apply_global_slice_to_chunk(self, chunk, global_slices, chunk_slices):
+    #     # Calculate local slice for this chunk
+    #     local_slices = []
+    #     for global_slice, chunk_slice in zip(global_slices, chunk_slices):
+    #         start = max(global_slice.start - chunk_slice.start, 0)
+    #         stop = min(global_slice.stop - chunk_slice.start, chunk_slice.stop - chunk_slice.start)
+    #         local_slices.append(slice(start, stop))
+
+    #     # Apply the local slice to the chunk
+    #     return chunk[tuple(local_slices)]
+
+    # def predict_instances_block(self, block, futures_chunks, client,
+    #                             chunk_size, **kwargs):
+    #     # Get the global slice for the current block
+    #     global_slice = block.slice_read(axes=kwargs["axes"])
+
+    #     # Submit the slicing task for each chunk
+    #     sliced_futures = []
+    #     for idx, chunk_future in enumerate(futures_chunks):
+    #         # idx should be a tuple with three elements corresponding to the three dimensions
+    #         chunk_slice = tuple(slice(start, start + size) for start, size in zip(idx, chunk_size))
+    #         sliced_future = client.submit(self.apply_global_slice_to_chunk, chunk_future, global_slice, chunk_slice)
+    #         sliced_futures.append(sliced_future)
+
+    #     # Gather the sliced results
+    #     sliced_results = client.gather(sliced_futures)
+
+    #     # Combine the sliced results into a single array
+    #     combined_result = np.concatenate([result.compute() for result in sliced_results], axis=0)
+    #     print(combined_result.shape)
+
+    #     # Proceed with your prediction using the combined result
+    #     labels, polys = self.predict_instances(combined_result, **kwargs)
+    #     return labels, polys, block
+
+    def predict_instances_block(self, block, img, **kwargs):
+        # Get the global slice for the current block
+        # global_slice = block.slice_read(axes=kwargs["axes"])
+        # print(global_slice)
+        # print("1")
+        img_block = block.read_dask(img, axes=kwargs["axes"])
+        # Proceed with your prediction using the combined result
+        # print("2")
+        data = img_block.compute()
+        # print("3")
+        time_usage, labels, polys = self.predict_instances(data, **kwargs)
+
+        return time_usage, labels, polys, block
+
+    def process_block_sequential(self, labels, polys, block, label_offset, axes_out):
+        from ..matching import relabel_sequential
+
+        labels = block.crop_context(labels, axes=axes_out)
+        labels, polys = block.filter_objects(labels, polys, axes=axes_out)
+        labels = relabel_sequential(labels, label_offset)[0]
+        return labels, polys, block
+
+    def predict_instances_big_dask(self, img, axes, block_size, min_overlap, context=None,
+                                   labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
+        """Predict instance segmentation from very large input images.
+
+        Intended to be used when `predict_instances` cannot be used due to memory limitations.
+        This function will break the input image into blocks and process them individually
+        via `predict_instances` and assemble all the partial results. If used as intended, the result
+        should be the same as if `predict_instances` was used directly on the whole image.
+
+        **Important**: The crucial assumption is that all predicted object instances are smaller than
+                       the provided `min_overlap`. Also, it must hold that: min_overlap + 2*context < block_size.
+
+        Example
+        -------
+        >>> img.shape
+        (20000, 20000)
+        >>> labels, polys = model.predict_instances_big(img, axes='YX', block_size=4096,
+                                                        min_overlap=128, context=128, n_tiles=(4,4))
+
+        Parameters
+        ----------
+        img: :class:`numpy.ndarray` or similar
+            Input image
+        axes: str
+            Axes of the input ``img`` (such as 'YX', 'ZYX', 'YXC', etc.)
+        block_size: int or iterable of int
+            Process input image in blocks of the provided shape.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        min_overlap: int or iterable of int
+            Amount of guaranteed overlap between blocks.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        context: int or iterable of int, or None
+            Amount of image context on all sides of a block, which is discarded.
+            If None, uses an automatic estimate that should work in many cases.
+            (If a scalar value is given, it is used for all spatial image dimensions.)
+        labels_out: :class:`numpy.ndarray` or similar, or None, or False
+            numpy array or similar (must be of correct shape) to which the label image is written.
+            If None, will allocate a numpy array of the correct shape and data type ``labels_out_dtype``.
+            If False, will not write the label image (useful if only the dictionary is needed).
+        labels_out_dtype: str or dtype
+            Data type of returned label image if ``labels_out=None`` (has no effect otherwise).
+        show_progress: bool
+            Show progress bar for block processing.
+        kwargs: dict
+            Keyword arguments for ``predict_instances``.
+
+        Returns
+        -------
+        (:class:`numpy.ndarray` or False, dict)
+            Returns the label image and a dictionary with the details (coordinates, etc.) of the polygons/polyhedra.
+
+        """
+        from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # , repaint_labels
+
+        n = img.ndim
+        axes = axes_check_and_normalize(axes, length=n)
+        grid = self._axes_div_by(axes)
+        axes_out = self._axes_out.replace('C', '')
+        shape_dict = dict(zip(axes, img.shape))
+        shape_out = tuple(shape_dict[a] for a in axes_out)
+
+        if context is None:
+            context = self._axes_tile_overlap(axes)
+
+        if np.isscalar(block_size):  block_size = n * [block_size]
+        if np.isscalar(min_overlap): min_overlap = n * [min_overlap]
+        if np.isscalar(context):     context = n * [context]
+        block_size, min_overlap, context = list(block_size), list(min_overlap), list(context)
+        assert n == len(block_size) == len(min_overlap) == len(context)
+
+        if 'C' in axes:
+            # single block for channel axis
+            i = axes_dict(axes)['C']
+            # if (block_size[i], min_overlap[i], context[i]) != (None, None, None):
+            #     print("Ignoring values of 'block_size', 'min_overlap', and 'context' for channel axis " +
+            #           "(set to 'None' to avoid this warning).", file=sys.stderr, flush=True)
+            block_size[i] = img.shape[i]
+            min_overlap[i] = context[i] = 0
+
+        block_size = tuple(
+            _grid_divisible(g, v, name='block_size', verbose=False) for v, g, a in zip(block_size, grid, axes))
+        min_overlap = tuple(
+            _grid_divisible(g, v, name='min_overlap', verbose=False) for v, g, a in zip(min_overlap, grid, axes))
+        context = tuple(_grid_divisible(g, v, name='context', verbose=False) for v, g, a in zip(context, grid, axes))
+
+        # print(f"input: shape {img_shape} with axes {axes}")
+        print(f'effective: block_size={block_size}, min_overlap={min_overlap}, context={context}', flush=True)
+
+        for a, c, o in zip(axes, context, self._axes_tile_overlap(axes)):
+            if c < o:
+                print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
+
+        # create block cover
+        blocks = BlockND.cover(img.shape, axes, block_size, min_overlap, context, grid)
+        num_blocks = len(blocks)
+        print("The number of blocks:", num_blocks)
+        if np.isscalar(labels_out) and bool(labels_out) is False:
+            labels_out = None
+        else:
+            if labels_out is None:
+                labels_out = np.zeros(shape_out, dtype=labels_out_dtype)
+            else:
+                labels_out.shape == shape_out or _raise(
+                    ValueError(f"'labels_out' must have shape {shape_out} (axes {axes_out})."))
+
+        polys_all = {}
+        # problem_ids = []
+        label_offset = 1
+
+        kwargs_override = dict(axes=axes, overlap_label=None, return_labels=True, return_predict=False)
+        if show_progress:
+            kwargs_override['show_tile_progress'] = False  # disable progress for predict_instances
+        for k, v in kwargs_override.items():
+            if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
+            kwargs[k] = v
+
+        print("Start Dask")
+
+        dask.config.set({
+            'distributed.comm.max-frame-size': '1024MiB',
+            'distributed.comm.timeouts.connect': '1200s',  # Increase connection timeout
+            'distributed.comm.timeouts.tcp': '1200s',  # TCP timeout setting
+            'distributed.worker.heartbeat': '1200s'  # Worker heartbeat interval
+        })
+
+        cluster = LocalCluster(
+            n_workers=4,  # Number of workers (one per block)
+            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
+            memory_limit='248GB',  # Memory limit per worker
+            timeout="6000s"
+        )
+        # cluster.adapt(minimum=1, maximum=4)
+        client = Client(cluster)
+        client.cluster.scheduler.work_stealing = True
+        print(client.dashboard_link)
+
+        def split_into_chunks(img, chunk_size):
+            chunks_img = []
+            for i in range(0, img.shape[1], chunk_size):
+                chunk = img[:, i:i + chunk_size, :]
+                chunks_img.append(chunk)
+            return chunks_img
+
+        # # Split the data into smaller chunks
+        chunk_size = 50
+        chunks = split_into_chunks(img, chunk_size)
+        # Sample chunk to define shape and dtype
+        sample = chunks[0]
+        print("Sample chunk shape:", sample.shape)
+        print("Sample chunk size (bytes):", sys.getsizeof(sample))
+
+        if sys.getsizeof(sample) > (1 * 1024 * 1024 * 1024):  # 1 GiB
+            raise ValueError(f"Chunk size is too large to be handled.")
+
+        # Scatter each chunk and create futures
+        print("Scattering")
+        chunk_futures = client.scatter(chunks, broadcast=True)
+        # client.rebalance()
+        print("Done Scattering")
+
+        # Reassemble the chunks into a Dask array from the futures
+        lazy_dask_arrays = [
+            da.from_delayed(client.submit(lambda x: x, future), shape=chunk.shape, dtype=chunk.dtype)
+            for future, chunk in zip(chunk_futures, chunks)
+        ]
+
+        # Concatenate the lazy Dask arrays into a single Dask array
+        dask_array = da.concatenate(lazy_dask_arrays, axis=1)
+
+        # Persist the Dask array to keep it in memory across the workers
+
+        dask_array = dask_array.persist()
+
+        # Optionally, rebalance the cluster to ensure even data distribution
+        # client.rebalance()
+        print("Done Persist")
+
+        # lazy_arrays = [dask.delayed(chunk) for chunk in chunks]
+
+        # # Convert each delayed chunk into a Dask array
+        # lazy_dask_arrays = [
+        #     da.from_delayed(lazy_array, shape=sample.shape, dtype=sample.dtype)
+        #     for lazy_array in lazy_arrays
+        # ]
+
+        # # Stack the lazy Dask arrays into a single Dask array
+        # dask_array = da.concatenate(lazy_dask_arrays, axis=1)
+        # # # Scatter the chunks to Dask workers
+        # print("Scattering")
+        # # Scatter the Dask array to the workers
+        # dask_array_future = client.scatter(dask_array)
+        # client.rebalance()
+
+        # # # print("Scattering")
+        # # # gc.collect()
+        # # # scattered_img = client.scatter(img_dask, broadcast=True)
+        # # # print("Done Scattering")
+        # # # Submit the tasks as futures with retries and keep track of their order
+        # print("Shape of dask array: ", dask_array.shape)
+        # dask_array_future = client.persist(dask_array_future)
+        # # Ensure the array is evenly distributed across workers
+        # client.rebalance()
+        # print("Done Scatter & Persist")
+        # Submit tasks in batches and get predictions
+        batch_size = 8
+        futures = []
+        future_to_index = {}
+        predictions = [None] * len(blocks)
+        for i in range(0, len(blocks), batch_size):
+            batch = blocks[i:i + batch_size]
+            batch_futures = [
+                client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
+                for block in batch
+            ]
+            futures.extend(batch_futures)
+            future_to_index.update({future: idx for idx, future in enumerate(batch_futures, start=i)})
+
+            # Use tqdm to show a progress bar for the completion of futures
+            with tqdm(total=len(batch_futures), desc=f"Processing Batch {i // batch_size + 1}") as pbar:
+                for future in as_completed(batch_futures):
+                    try:
+                        result = future.result()
+                        idx = future_to_index[future]
+                        predictions[idx] = result
+                        pbar.update(1)
+                    except Exception as e:
+                        print(f"Task failed: {e}")
+
+        # Optionally, shut down the Dask client if no longer needed
+        client.close()
+        # predictions = img_dask.map_blocks(self.predict_instances_block, dtype=float, meta=np.array(()))
+        # Apply sequential operations on the results
+        results = []
+        time_usage_all = []
+        for time_usage, labels, polys, block in predictions:
+            print(block)
+            print(time_usage)
+            labels, polys, block = self.process_block_sequential(labels, polys, block, label_offset, axes_out)
+            results.append((labels, polys, block))
+            time_usage_all.append(time_usage)
+
+            if labels_out is not None:
+                block.write(labels_out, labels, axes=axes_out)
+
+            for k, v in polys.items():
+                polys_all.setdefault(k, []).append(v)
+
+            label_offset += len(polys['prob'])
+            del labels
+
+        polys_all = {k: (np.concatenate(v) if k in OBJECT_KEYS else v[0]) for k, v in polys_all.items()}
+        time_usage_all = np.array(time_usage_all)
+        # Calculate the mean for each column
+        column_means = np.mean(time_usage_all, axis=0)
+        print("Mean of time:", column_means)
+        return labels_out, polys_all
+
     def optimize_thresholds(self, X_val, Y_val, nms_threshs=[0.3, 0.4, 0.5], iou_threshs=[0.3, 0.5, 0.7],
                             predict_kwargs=None, optimize_kwargs=None, save_to_json=True):
         """Optimize two thresholds (probability, NMS overlap) necessary for predicting object instances.
@@ -1273,8 +1350,7 @@ class StarDistBase(BaseModel):
 
         opt_prob_thresh, opt_measure, opt_nms_thresh = None, -np.inf, None
         for _opt_nms_thresh in nms_threshs:
-            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val, Yhat_val, model=self,
-                                                                nms_thresh=_opt_nms_thresh,
+            _opt_prob_thresh, _opt_measure = optimize_threshold(Y_val, Yhat_val, model=self, nms_thresh=_opt_nms_thresh,
                                                                 iou_threshs=iou_threshs, **optimize_kwargs)
             if _opt_measure > opt_measure:
                 opt_prob_thresh, opt_measure, opt_nms_thresh = _opt_prob_thresh, _opt_measure, _opt_nms_thresh
@@ -1459,4 +1535,3 @@ class StarDistPadAndCropResizer(Resizer):
 def _tf_version_at_least(version_string="1.0.0"):
     from packaging import version
     return version.parse(tf.__version__) >= version.parse(version_string)
-
