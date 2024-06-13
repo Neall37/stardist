@@ -433,9 +433,13 @@ class StarDistBase(BaseModel):
         if not _is_floatarray(x):
             warnings.warn("Predicting on non-float input... ( forgot to normalize? )")
 
+        # def predict_direct(x):
+        #     ys = self.keras_model.predict(x[np.newaxis], **predict_kwargs)
+        #     return tuple(y[0] for y in ys)
         def predict_direct(x):
-            ys = self.keras_model.predict(x[np.newaxis], **predict_kwargs)
-            return tuple(y[0] for y in ys)
+            x_tensor = tf.convert_to_tensor(x[np.newaxis], dtype=tf.float32)  # Ensure input is a tensor
+            ys = self.keras_model(x_tensor, training=False)  # Directly use the model for inference
+            return tuple(y.numpy()[0] for y in ys)
 
         def tiling_setup():
             assert np.prod(n_tiles) > 1
@@ -837,9 +841,9 @@ class StarDistBase(BaseModel):
         # print("2")
         data = img_block.compute()
         # print("3")
-        labels, polys = self.predict_instances(data, **kwargs)
+        time_usage, labels, polys = self.predict_instances(data, **kwargs)
 
-        return labels, polys, block
+        return time_usage, labels, polys, block
 
     def process_block_sequential(self, labels, polys, block, label_offset, axes_out):
         from ..matching import relabel_sequential
@@ -965,6 +969,18 @@ class StarDistBase(BaseModel):
             if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
             kwargs[k] = v
 
+        print("Start Dask")
+        dask.config.set({'distributed.comm.max-frame-size': '1024MiB'})
+
+        cluster = LocalCluster(
+            n_workers=3,  # Number of workers (one per block)
+            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
+            memory_limit='200GB',  # Memory limit per worker
+            timeout="720s"
+        )
+        client = Client(cluster)
+        print(client.dashboard_link)
+
         def split_into_chunks(img, chunk_size):
             chunks_img = []
             for i in range(0, img.shape[1], chunk_size):
@@ -977,54 +993,44 @@ class StarDistBase(BaseModel):
         chunks = split_into_chunks(img, chunk_size)
         # Sample chunk to define shape and dtype
         sample = chunks[0]
-        print(sample.shape)
+        print("Sample chunk shape:", sample.shape)
+        print("Sample chunk size (bytes):", sys.getsizeof(sample))
 
         if sys.getsizeof(sample) > (1 * 1024 * 1024 * 1024):  # 1 GiB
             raise ValueError(f"Chunk size is too large to be handled.")
 
-        print("Start Dask")
-        dask.config.set({'distributed.comm.max-frame-size': '500MiB'})
+        # Scatter each chunk and create futures
+        print("Scattering")
+        chunk_futures = client.scatter(chunks)
+        client.rebalance()
+        print("Done Scattering")
 
-        cluster = LocalCluster(
-            n_workers=3,  # Number of workers (one per block)
-            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
-            memory_limit='200GB',  # Memory limit per worker
-            timeout="120s"
-        )
-        client = Client(cluster)
-        # print(client.dashboard_link)
-
-        lazy_arrays = [dask.delayed(chunk) for chunk in chunks]
-
-        # Convert each delayed chunk into a Dask array
+        # Reassemble the chunks into a Dask array from the futures
         lazy_dask_arrays = [
-            da.from_delayed(lazy_array, shape=sample.shape, dtype=sample.dtype)
-            for lazy_array in lazy_arrays
+            da.from_delayed(client.submit(lambda x: x, future), shape=chunk.shape, dtype=chunk.dtype)
+            for future, chunk in zip(chunk_futures, chunks)
         ]
 
-        # Stack the lazy Dask arrays into a single Dask array
+        # Concatenate the lazy Dask arrays into a single Dask array
         dask_array = da.concatenate(lazy_dask_arrays, axis=1)
-        # # Scatter the chunks to Dask workers
-        print("Scattering")
-        # Scatter the Dask array to the workers
-        dask_array_future = client.scatter(dask_array)
-        print("Done Scattering")
-        # # print("Scattering")
-        # # gc.collect()
-        # # scattered_img = client.scatter(img_dask, broadcast=True)
-        # # print("Done Scattering")
-        # # Submit the tasks as futures with retries and keep track of their order
-        print("Shape of dask array: ", dask_array.shape)
+
+        # Persist the Dask array to keep it in memory across the workers
+
+        dask_array = dask_array.persist()
+
+        # Optionally, rebalance the cluster to ensure even data distribution
+        client.rebalance()
+        print("Done Persist")
 
         # Submit tasks in batches and get predictions
-        batch_size = 100
+        batch_size = 50
         futures = []
         future_to_index = {}
         predictions = [None] * len(blocks)
         for i in range(0, len(blocks), batch_size):
             batch = blocks[i:i + batch_size]
             batch_futures = [
-                client.submit(self.predict_instances_block, block, dask_array_future, retries=3, **kwargs)
+                client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
                 for block in batch
             ]
             futures.extend(batch_futures)
@@ -1046,9 +1052,11 @@ class StarDistBase(BaseModel):
         # predictions = img_dask.map_blocks(self.predict_instances_block, dtype=float, meta=np.array(()))
         # Apply sequential operations on the results
         results = []
-        for labels, polys, block in predictions:
+        time_usage_all = []
+        for time_usage, labels, polys, block in predictions:
             labels, polys, block = self.process_block_sequential(labels, polys, block, label_offset, axes_out)
             results.append((labels, polys, block))
+            time_usage_all.append(time_usage)
 
             if labels_out is not None:
                 block.write(labels_out, labels, axes=axes_out)
@@ -1060,7 +1068,8 @@ class StarDistBase(BaseModel):
             del labels
 
         polys_all = {k: (np.concatenate(v) if k in OBJECT_KEYS else v[0]) for k, v in polys_all.items()}
-
+        time_usage_all = np.array(time_usage_all)
+        print(time_usage_all.shape)
         return labels_out, polys_all
 
 
@@ -1183,7 +1192,7 @@ class StarDistBase(BaseModel):
         blocks = tqdm(blocks, disable=(not show_progress))
         # actual computation
         for block in blocks:
-            labels, polys = self.predict_instances(block.read(img, axes=axes), **kwargs)
+            time_usage, labels, polys = self.predict_instances(block.read(img, axes=axes), **kwargs)
             labels = block.crop_context(labels, axes=axes_out)
             labels, polys = block.filter_objects(labels, polys, axes=axes_out)
             # TODO: relabel_sequential is not very memory-efficient (will allocate memory proportional to label_offset)

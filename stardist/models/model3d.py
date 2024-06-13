@@ -587,10 +587,9 @@ class StarDist3D(StarDistBase):
 
         return history
 
-    def _instances_from_prediction(self, img_shape, prob, dist, points=None,
-                                   prob_class=None, prob_thresh=None, nms_thresh=None,
-                                   overlap_label=None, return_labels=True, scale=None,
-                                   affinity=False, affinity_thresh=None,**nms_kwargs):
+    def _instances_from_prediction(self, img_shape, prob, dist, points=None, prob_class=None, prob_thresh=None,
+                                   nms_thresh=None, overlap_label=None, return_labels=True, scale=None, affinity=False,
+                                   affinity_thresh=None, **nms_kwargs):
         """
         if points is None     -> dense prediction
         if points is not None -> sparse prediction
@@ -599,38 +598,48 @@ class StarDist3D(StarDistBase):
         if prob_class is not None -> multi  class prediction
         """
         if prob_thresh is None: prob_thresh = self.thresholds.prob
-        if nms_thresh  is None: nms_thresh  = self.thresholds.nms
+        if nms_thresh is None: nms_thresh = self.thresholds.nms
 
         rays = rays_from_json(self.config.rays_json)
+        time_usage = []
 
+        start_time_NMS = time.time()
         # sparse prediction
         if points is not None:
-            points, probi, disti, indsi = non_maximum_suppression_3d_sparse(dist, prob, points, rays, nms_thresh=nms_thresh, **nms_kwargs)
+            points, probi, disti, indsi = non_maximum_suppression_3d_sparse(dist, prob, points, rays,
+                                                                            nms_thresh=nms_thresh, **nms_kwargs)
             if prob_class is not None:
                 prob_class = prob_class[indsi]
 
         # dense prediction
         else:
             points, probi, disti = non_maximum_suppression_3d(dist, prob, rays, grid=self.config.grid,
-                                                              prob_thresh=prob_thresh, nms_thresh=nms_thresh, **nms_kwargs)
+                                                              prob_thresh=prob_thresh, nms_thresh=nms_thresh,
+                                                              **nms_kwargs)
             if prob_class is not None:
-                inds = tuple(p//g for p,g in zip(points.T, self.config.grid))
+                inds = tuple(p // g for p, g in zip(points.T, self.config.grid))
                 prob_class = prob_class[inds]
 
-        verbose = nms_kwargs.get('verbose',False)
+        # End the timer
+        end_time_NMS = time.time()
+
+        # Calculate the elapsed time
+        elapsed_time_NMS = end_time_NMS - start_time_NMS
+        time_usage.append(elapsed_time_NMS)
+        verbose = nms_kwargs.get('verbose', False)
         verbose and print("render polygons...")
 
         if scale is not None:
             # need to undo the scaling given by the scale dict, e.g. scale = dict(X=0.5,Y=0.5,Z=1.0):
             #   1. re-scale points (origins of polyhedra)
             #   2. re-scale vectors of rays object (computed from distances)
-            if not (isinstance(scale,dict) and 'X' in scale and 'Y' in scale and 'Z' in scale):
+            if not (isinstance(scale, dict) and 'X' in scale and 'Y' in scale and 'Z' in scale):
                 raise ValueError("scale must be a dictionary with entries for 'X', 'Y', and 'Z'")
-            rescale = (1/scale['Z'],1/scale['Y'],1/scale['X'])
-            points = points * np.array(rescale).reshape(1,3)
+            rescale = (1 / scale['Z'], 1 / scale['Y'], 1 / scale['X'])
+            points = points * np.array(rescale).reshape(1, 3)
             rays = rays.copy(scale=rescale)
         else:
-            rescale = (1,1,1)
+            rescale = (1, 1, 1)
 
         if return_labels:
             if affinity:
@@ -639,18 +648,38 @@ class StarDist3D(StarDistBase):
                                                   rays=rays,
                                                   weights=prob >= affinity_thresh,
                                                   grid=self.config.grid,
-                                                  normed=True, verbose=verbose);
+                                                  normed=True, verbose=False);
 
                 ws_potential = zoom(np.mean(aff, -1) * prob,
                                     zoom_factor, order=1)
                 mask = ws_potential > affinity_thresh
                 # markers      = np.zeros(img_shape, np.int32)
                 # markers[points[:,0],points[:,1],points[:,2]] = np.arange(len(points))+1
+                start_time_polyhedron_to_label = time.time()
                 markers = polyhedron_to_label(disti, points, rays=rays, prob=probi,
                                               shape=img_shape, overlap_label=overlap_label,
                                               verbose=verbose)
+                # End the timer
+                end_time_polyhedron_to_label = time.time()
 
+                # Calculate the elapsed time
+                elapsed_time_polyhedron_to_label = end_time_polyhedron_to_label - start_time_polyhedron_to_label
+
+                # Print the elapsed time
+                time_usage.append(elapsed_time_polyhedron_to_label)
+                print(f"Time taken for polyhedron_to_label: {elapsed_time_polyhedron_to_label} seconds")
+
+                start_time_watershed = time.time()
                 labels = watershed(-ws_potential, markers=markers, mask=mask)
+
+                end_time_watershed = time.time()
+
+                # Calculate the elapsed time
+                elapsed_time_watershed = end_time_watershed - start_time_watershed
+
+                # Print the elapsed time
+                time_usage.append(elapsed_time_watershed)
+                print(f"Time taken for watershed: {elapsed_time_watershed} seconds")
 
             else:
                 labels = polyhedron_to_label(disti, points, rays=rays, prob=probi,
@@ -658,21 +687,32 @@ class StarDist3D(StarDistBase):
                                              verbose=verbose)
             # map the overlap_label to something positive and back
             # (as relabel_sequential doesn't like negative values)
-            if overlap_label is not None and overlap_label<0 and (overlap_label in labels):
+            start_time_overlap = time.time()
+            if overlap_label is not None and overlap_label < 0 and (overlap_label in labels):
                 overlap_mask = (labels == overlap_label)
-                overlap_label2 = max(set(np.unique(labels))-{overlap_label})+1
+                overlap_label2 = max(set(np.unique(labels)) - {overlap_label}) + 1
                 labels[overlap_mask] = overlap_label2
                 labels, fwd, bwd = relabel_sequential(labels)
                 labels[labels == fwd[overlap_label2]] = overlap_label
             else:
                 # TODO relabel_sequential necessary?
                 # print(np.unique(labels))
-                labels, _,_ = relabel_sequential(labels)
+                labels, _, _ = relabel_sequential(labels)
                 # print(np.unique(labels))
+
+            end_time_overlap = time.time()
+
+            # Calculate the elapsed time
+            elapsed_time_overlap = end_time_overlap - start_time_overlap
+
+            # Print the elapsed time
+            time_usage.append(elapsed_time_overlap)
+            print(f"Time taken for overlap: {elapsed_time_overlap} seconds")
         else:
             labels = None
 
-        res_dict = dict(dist=disti, markers=markers, points=points, prob=probi, rays=rays, rays_vertices=rays.vertices, rays_faces=rays.faces)
+        res_dict = dict(dist=disti, markers=markers, points=points, prob=probi, rays=rays, rays_vertices=rays.vertices,
+                        rays_faces=rays.faces)
 
         if prob_class is not None:
             # build the list of class ids per label via majority vote
@@ -696,7 +736,7 @@ class StarDist3D(StarDistBase):
             class_id = np.argmax(prob_class, axis=-1)
             res_dict.update(dict(class_prob=prob_class, class_id=class_id))
 
-        return labels, res_dict
+        return labels, res_dict, time_usage
 
 
     def _axes_div_by(self, query_axes):
