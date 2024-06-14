@@ -1098,10 +1098,11 @@ class StarDistBase(BaseModel):
         from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # , repaint_labels
 
         n = img.ndim
+        img_shape = img.shape
         axes = axes_check_and_normalize(axes, length=n)
         grid = self._axes_div_by(axes)
         axes_out = self._axes_out.replace('C', '')
-        shape_dict = dict(zip(axes, img.shape))
+        shape_dict = dict(zip(axes, img_shape))
         shape_out = tuple(shape_dict[a] for a in axes_out)
 
         if context is None:
@@ -1119,7 +1120,7 @@ class StarDistBase(BaseModel):
             # if (block_size[i], min_overlap[i], context[i]) != (None, None, None):
             #     print("Ignoring values of 'block_size', 'min_overlap', and 'context' for channel axis " +
             #           "(set to 'None' to avoid this warning).", file=sys.stderr, flush=True)
-            block_size[i] = img.shape[i]
+            block_size[i] = img_shape[i]
             min_overlap[i] = context[i] = 0
 
         block_size = tuple(
@@ -1136,7 +1137,7 @@ class StarDistBase(BaseModel):
                 print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
 
         # create block cover
-        blocks = BlockND.cover(img.shape, axes, block_size, min_overlap, context, grid)
+        blocks = BlockND.cover(img_shape, axes, block_size, min_overlap, context, grid)
         num_blocks = len(blocks)
         print("The number of blocks:", num_blocks)
         if np.isscalar(labels_out) and bool(labels_out) is False:
@@ -1163,15 +1164,15 @@ class StarDistBase(BaseModel):
 
         dask.config.set({
             'distributed.comm.max-frame-size': '1024MiB',
-            'distributed.comm.timeouts.connect': '1200s',  # Increase connection timeout
-            'distributed.comm.timeouts.tcp': '1200s',  # TCP timeout setting
-            'distributed.worker.heartbeat': '1200s'  # Worker heartbeat interval
+            'distributed.comm.timeouts.connect': '3600s',  # Increase connection timeout
+            'distributed.comm.timeouts.tcp': '3600s',  # TCP timeout setting
+            'distributed.scheduler.worker-ttl': None  # Worker heartbeat interval
         })
 
         cluster = LocalCluster(
-            n_workers=4,  # Number of workers (one per block)
-            threads_per_worker=64,  # Number of threads per worker (adjust as needed)
-            memory_limit='248GB',  # Memory limit per worker
+            n_workers=8,  # Number of workers (one per block)
+            threads_per_worker=24,  # Number of threads per worker (adjust as needed)
+            memory_limit='100GB',  # Memory limit per worker
             timeout="6000s"
         )
         # cluster.adapt(minimum=1, maximum=4)
@@ -1187,7 +1188,7 @@ class StarDistBase(BaseModel):
             return chunks_img
 
         # # Split the data into smaller chunks
-        chunk_size = 50
+        chunk_size = 100
         chunks = split_into_chunks(img, chunk_size)
         # Sample chunk to define shape and dtype
         sample = chunks[0]
@@ -1197,10 +1198,10 @@ class StarDistBase(BaseModel):
         if sys.getsizeof(sample) > (1 * 1024 * 1024 * 1024):  # 1 GiB
             raise ValueError(f"Chunk size is too large to be handled.")
 
-        # Scatter each chunk and create futures
+        # Scatter each chunk and create futures, broadcast=True
         print("Scattering")
-        chunk_futures = client.scatter(chunks, broadcast=True)
-        # client.rebalance()
+        chunk_futures = client.scatter(chunks)
+        client.rebalance()
         print("Done Scattering")
 
         # Reassemble the chunks into a Dask array from the futures
@@ -1217,7 +1218,7 @@ class StarDistBase(BaseModel):
         dask_array = dask_array.persist()
 
         # Optionally, rebalance the cluster to ensure even data distribution
-        # client.rebalance()
+        client.rebalance()
         print("Done Persist")
 
         # lazy_arrays = [dask.delayed(chunk) for chunk in chunks]
@@ -1247,6 +1248,9 @@ class StarDistBase(BaseModel):
         # client.rebalance()
         # print("Done Scatter & Persist")
         # Submit tasks in batches and get predictions
+
+        # if batch_size:
+        # print("Warning:")
         batch_size = 8
         futures = []
         future_to_index = {}
