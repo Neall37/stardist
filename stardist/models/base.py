@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import warnings
 import math
+from csbdeep.utils import normalize
 from tqdm import tqdm
 from multiprocessing import Pool, Manager, cpu_count
 from collections import namedtuple
@@ -549,6 +550,7 @@ class StarDistBase(BaseModel):
             # predict_direct -> prob, dist, [prob_class if multi_class]
             result = predict_direct(x)
         end_time_predict_direct = time.time()
+        gc.collect()
         elapsed_time_predict_direct = end_time_predict_direct - start_time_predict_direct
 
         print(f"Time taken for predict_direct: {elapsed_time_predict_direct} seconds")
@@ -1030,8 +1032,10 @@ class StarDistBase(BaseModel):
         # Proceed with your prediction using the combined result
         # print("2")
         data = img_block.compute()
+        data = normalize(data, 1, 99.8)
         # print("3")
         time_usage, labels, polys = self.predict_instances(data, **kwargs)
+        gc.collect()
 
         return time_usage, labels, polys, block
 
@@ -1043,7 +1047,7 @@ class StarDistBase(BaseModel):
         labels = relabel_sequential(labels, label_offset)[0]
         return labels, polys, block
 
-    def predict_instances_big_dask(self, img, axes, block_size, min_overlap, context=None,
+    def predict_instances_big_dask(self, cluster, batch_size, img, axes, block_size, min_overlap, context=None,
                                    labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
         """Predict instance segmentation from very large input images.
 
@@ -1162,19 +1166,6 @@ class StarDistBase(BaseModel):
 
         print("Start Dask")
 
-        dask.config.set({
-            'distributed.comm.max-frame-size': '1024MiB',
-            'distributed.comm.timeouts.connect': '3600s',  # Increase connection timeout
-            'distributed.comm.timeouts.tcp': '3600s',  # TCP timeout setting
-            'distributed.scheduler.worker-ttl': None  # Worker heartbeat interval
-        })
-
-        cluster = LocalCluster(
-            n_workers=8,  # Number of workers (one per block)
-            threads_per_worker=24,  # Number of threads per worker (adjust as needed)
-            memory_limit='100GB',  # Memory limit per worker
-            timeout="6000s"
-        )
         # cluster.adapt(minimum=1, maximum=4)
         client = Client(cluster)
         client.cluster.scheduler.work_stealing = True
@@ -1251,7 +1242,7 @@ class StarDistBase(BaseModel):
 
         # if batch_size:
         # print("Warning:")
-        batch_size = 8
+
         futures = []
         future_to_index = {}
         predictions = [None] * len(blocks)
@@ -1281,21 +1272,21 @@ class StarDistBase(BaseModel):
         # Apply sequential operations on the results
         results = []
         time_usage_all = []
-        for time_usage, labels, polys, block in predictions:
-            print(block)
-            print(time_usage)
-            labels, polys, block = self.process_block_sequential(labels, polys, block, label_offset, axes_out)
-            results.append((labels, polys, block))
-            time_usage_all.append(time_usage)
+        with tqdm(total=len(predictions), desc=f"Processing block overlap for labels") as pbar:
+            for time_usage, labels, polys, block in predictions:
+                labels, polys, block = self.process_block_sequential(labels, polys, block, label_offset, axes_out)
+                results.append((labels, polys, block))
+                time_usage_all.append(time_usage)
 
-            if labels_out is not None:
-                block.write(labels_out, labels, axes=axes_out)
+                if labels_out is not None:
+                    block.write(labels_out, labels, axes=axes_out)
 
-            for k, v in polys.items():
-                polys_all.setdefault(k, []).append(v)
+                for k, v in polys.items():
+                    polys_all.setdefault(k, []).append(v)
 
-            label_offset += len(polys['prob'])
-            del labels
+                label_offset += len(polys['prob'])
+                del labels
+                pbar.update(1)
 
         polys_all = {k: (np.concatenate(v) if k in OBJECT_KEYS else v[0]) for k, v in polys_all.items()}
         time_usage_all = np.array(time_usage_all)

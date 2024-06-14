@@ -4,8 +4,7 @@ import numpy as np
 import warnings
 import math
 from tqdm import tqdm
-import time
-
+import gc
 
 from csbdeep.models import BaseConfig
 from csbdeep.internals.blocks import conv_block3, unet_block, resnet_block
@@ -13,9 +12,11 @@ from csbdeep.utils import _raise, backend_channels_last, axes_check_and_normaliz
 from csbdeep.utils.tf import keras_import, IS_TF_1, CARETensorBoard, CARETensorBoardImage, IS_KERAS_3_PLUS, BACKEND as K
 from packaging.version import Version
 from scipy.ndimage import zoom
-from skimage.measure  import regionprops
+from skimage.measure import regionprops
+
 keras = keras_import()
-Input, Conv3D, MaxPooling3D, UpSampling3D, Add, Concatenate = keras_import('layers', 'Input', 'Conv3D', 'MaxPooling3D', 'UpSampling3D', 'Add', 'Concatenate')
+Input, Conv3D, MaxPooling3D, UpSampling3D, Add, Concatenate = keras_import('layers', 'Input', 'Conv3D', 'MaxPooling3D',
+                                                                           'UpSampling3D', 'Add', 'Concatenate')
 Model = keras_import('models', 'Model')
 
 from .base import StarDistBase, StarDistDataBase, _tf_version_at_least
@@ -27,14 +28,17 @@ from ..rays3d import Rays_GoldenSpiral, rays_from_json
 from ..nms import non_maximum_suppression_3d, non_maximum_suppression_3d_sparse
 from ..affinity import dist_to_affinity3D, max_sparsify
 from skimage.segmentation import watershed
+import time
 
 _gen_rtype = list if IS_TF_1 else tuple
+
 
 class StarDistData3D(StarDistDataBase):
 
     def __init__(self, X, Y, batch_size, rays, length,
                  n_classes=None, classes=None,
-                 patch_size=(128,128,128), grid=(1,1,1), anisotropy=None, augmenter=None, foreground_prob=0, **kwargs):
+                 patch_size=(128, 128, 128), grid=(1, 1, 1), anisotropy=None, augmenter=None, foreground_prob=0,
+                 **kwargs):
         # TODO: support shape completion as in 2D?
 
         super().__init__(X=X, Y=Y, n_rays=len(rays), grid=grid,
@@ -47,14 +51,16 @@ class StarDistData3D(StarDistDataBase):
         self.sd_mode = 'opencl' if self.use_gpu else 'cpp'
         # re-use arrays
         if self.batch_size > 1:
-            self.out_X = np.empty((self.batch_size,)+tuple(self.patch_size)+(() if self.n_channel is None else (self.n_channel,)), dtype=np.float32)
-            patch_size_grid = tuple((p-1)//g+1 for p,g in zip(self.patch_size,self.grid))
-            self.out_mask_neg_labels = np.empty((self.batch_size,)+patch_size_grid, dtype=bool)
-            self.out_edt_prob = np.empty((self.batch_size,)+patch_size_grid, dtype=np.float32)
-            self.out_star_dist3D = np.empty((self.batch_size,)+patch_size_grid+(len(self.rays),), dtype=np.float32)
+            self.out_X = np.empty(
+                (self.batch_size,) + tuple(self.patch_size) + (() if self.n_channel is None else (self.n_channel,)),
+                dtype=np.float32)
+            patch_size_grid = tuple((p - 1) // g + 1 for p, g in zip(self.patch_size, self.grid))
+            self.out_mask_neg_labels = np.empty((self.batch_size,) + patch_size_grid, dtype=bool)
+            self.out_edt_prob = np.empty((self.batch_size,) + patch_size_grid, dtype=np.float32)
+            self.out_star_dist3D = np.empty((self.batch_size,) + patch_size_grid + (len(self.rays),), dtype=np.float32)
             if self.n_classes is not None:
-                self.out_prob_class = np.empty((self.batch_size,)+tuple(self.patch_size)+(self.n_classes+1,), dtype=np.float32)
-
+                self.out_prob_class = np.empty((self.batch_size,) + tuple(self.patch_size) + (self.n_classes + 1,),
+                                               dtype=np.float32)
 
     def __getitem__(self, i):
         idx = self.batch(i)
@@ -63,11 +69,11 @@ class StarDistData3D(StarDistDataBase):
                                  valid_inds=self.get_valid_inds(k)) for k in idx]
 
         if self.n_channel is None:
-            X, Y = list(zip(*[(x[0],y[0]) for y,x in arrays]))
+            X, Y = list(zip(*[(x[0], y[0]) for y, x in arrays]))
         else:
-            X, Y = list(zip(*[(np.stack([_x[0] for _x in x],axis=-1), y[0]) for y,*x in arrays]))
+            X, Y = list(zip(*[(np.stack([_x[0] for _x in x], axis=-1), y[0]) for y, *x in arrays]))
 
-        X, Y = tuple(zip(*tuple(self.augmenter(_x, _y) for _x, _y in zip(X,Y))))
+        X, Y = tuple(zip(*tuple(self.augmenter(_x, _y) for _x, _y in zip(X, Y))))
 
         tmp = [y[self.ss_grid[1:]] < 0 for y in Y]
         has_neg_labels = any(m.any() for m in tmp)
@@ -83,8 +89,8 @@ class StarDistData3D(StarDistDataBase):
             X = X[0][np.newaxis]
         else:
             X = np.stack(X, out=self.out_X[:len(Y)])
-        if X.ndim == 4: # input image has no channel axis
-            X = np.expand_dims(X,-1)
+        if X.ndim == 4:  # input image has no channel axis
+            X = np.expand_dims(X, -1)
 
         tmp = [edt_prob(lbl, anisotropy=self.anisotropy)[self.ss_grid[1:]] for lbl in Y]
         if len(Y) == 1:
@@ -101,16 +107,16 @@ class StarDistData3D(StarDistDataBase):
         prob = dist_mask = np.expand_dims(prob, -1)
 
         # append dist_mask to dist as additional channel
-        dist = np.concatenate([dist,dist_mask],axis=-1)
+        dist = np.concatenate([dist, dist_mask], axis=-1)
 
         if has_neg_labels:
             prob[mask_neg_labels] = -1  # set to -1 to disable loss
 
         # note: must return tuples in keras 3 (cf. https://stackoverflow.com/a/78158487)
         if self.n_classes is None:
-            return _gen_rtype((X,)), _gen_rtype((prob,dist))
+            return _gen_rtype((X,)), _gen_rtype((prob, dist))
         else:
-            tmp = [mask_to_categorical(y, self.n_classes, self.classes[k]) for y,k in zip(Y, idx)]
+            tmp = [mask_to_categorical(y, self.n_classes, self.classes[k]) for y, k in zip(Y, idx)]
             # TODO: downsample here before stacking?
             if len(Y) == 1:
                 prob_class = tmp[0][np.newaxis]
@@ -120,13 +126,12 @@ class StarDistData3D(StarDistDataBase):
             # TODO: investigate downsampling via simple indexing vs. using 'zoom'
             # prob_class = prob_class[self.ss_grid]
             # 'zoom' might lead to better registered maps (especially if upscaled later)
-            prob_class = zoom(prob_class, (1,)+tuple(1/g for g in self.grid)+(1,), order=0)
+            prob_class = zoom(prob_class, (1,) + tuple(1 / g for g in self.grid) + (1,), order=0)
 
             if has_neg_labels:
                 prob_class[mask_neg_labels] = -1  # set to -1 to disable loss
 
-            return _gen_rtype((X,)), _gen_rtype((prob,dist, prob_class))
-
+            return _gen_rtype((X,)), _gen_rtype((prob, dist, prob_class))
 
 
 class Config3D(BaseConfig):
@@ -214,7 +219,8 @@ class Config3D(BaseConfig):
         .. _ReduceLROnPlateau: https://keras.io/api/callbacks/reduce_lr_on_plateau/
     """
 
-    def __init__(self, axes='ZYX', rays=None, n_channel_in=1, grid=(1,1,1), n_classes=None, anisotropy=None, backbone='unet', **kwargs):
+    def __init__(self, axes='ZYX', rays=None, n_channel_in=1, grid=(1, 1, 1), n_classes=None, anisotropy=None,
+                 backbone='unet', **kwargs):
 
         if rays is None:
             if 'rays_json' in kwargs:
@@ -226,15 +232,15 @@ class Config3D(BaseConfig):
         elif np.isscalar(rays):
             rays = Rays_GoldenSpiral(rays)
 
-        super().__init__(axes=axes, n_channel_in=n_channel_in, n_channel_out=1+len(rays))
+        super().__init__(axes=axes, n_channel_in=n_channel_in, n_channel_out=1 + len(rays))
 
         # directly set by parameters
-        self.n_rays                    = len(rays)
-        self.grid                      = _normalize_grid(grid,3)
-        self.anisotropy                = anisotropy if anisotropy is None else tuple(anisotropy)
-        self.backbone                  = str(backbone).lower()
-        self.rays_json                 = rays.to_json()
-        self.n_classes                 = None if n_classes is None else int(n_classes)
+        self.n_rays = len(rays)
+        self.grid = _normalize_grid(grid, 3)
+        self.anisotropy = anisotropy if anisotropy is None else tuple(anisotropy)
+        self.backbone = str(backbone).lower()
+        self.rays_json = rays.to_json()
+        self.n_classes = None if n_classes is None else int(n_classes)
 
         if 'anisotropy' in self.rays_json['kwargs']:
             if self.rays_json['kwargs']['anisotropy'] is None and self.anisotropy is not None:
@@ -245,73 +251,78 @@ class Config3D(BaseConfig):
 
         # default config (can be overwritten by kwargs below)
         if self.backbone == 'unet':
-            self.unet_n_depth            = 2
-            self.unet_kernel_size        = 3,3,3
-            self.unet_n_filter_base      = 32
-            self.unet_n_conv_per_depth   = 2
-            self.unet_pool               = 2,2,2
-            self.unet_activation         = 'relu'
-            self.unet_last_activation    = 'relu'
-            self.unet_batch_norm         = False
-            self.unet_dropout            = 0.0
-            self.unet_prefix             = ''
-            self.net_conv_after_unet     = 128
+            self.unet_n_depth = 2
+            self.unet_kernel_size = 3, 3, 3
+            self.unet_n_filter_base = 32
+            self.unet_n_conv_per_depth = 2
+            self.unet_pool = 2, 2, 2
+            self.unet_activation = 'relu'
+            self.unet_last_activation = 'relu'
+            self.unet_batch_norm = False
+            self.unet_dropout = 0.0
+            self.unet_prefix = ''
+            self.net_conv_after_unet = 128
         elif self.backbone == 'resnet':
-            self.resnet_n_blocks         = 4
-            self.resnet_kernel_size      = 3,3,3
-            self.resnet_kernel_init      = 'he_normal'
-            self.resnet_n_filter_base    = 32
+            self.resnet_n_blocks = 4
+            self.resnet_kernel_size = 3, 3, 3
+            self.resnet_kernel_init = 'he_normal'
+            self.resnet_n_filter_base = 32
             self.resnet_n_conv_per_block = 3
-            self.resnet_activation       = 'relu'
-            self.resnet_batch_norm       = False
-            self.net_conv_after_resnet   = 128
+            self.resnet_activation = 'relu'
+            self.resnet_batch_norm = False
+            self.net_conv_after_resnet = 128
         else:
             raise ValueError("backbone '%s' not supported." % self.backbone)
 
         # net_mask_shape not needed but kept for legacy reasons
         if backend_channels_last():
-            self.net_input_shape       = None,None,None,self.n_channel_in
-            self.net_mask_shape        = None,None,None,1
+            self.net_input_shape = None, None, None, self.n_channel_in
+            self.net_mask_shape = None, None, None, 1
         else:
-            self.net_input_shape       = self.n_channel_in,None,None,None
-            self.net_mask_shape        = 1,None,None,None
+            self.net_input_shape = self.n_channel_in, None, None, None
+            self.net_mask_shape = 1, None, None, None
 
         # self.train_shape_completion    = False
         # self.train_completion_crop     = 32
-        self.train_patch_size          = 128,128,128
-        self.train_background_reg      = 1e-4
-        self.train_foreground_only     = 0.9
-        self.train_sample_cache        = True
+        self.train_patch_size = 128, 128, 128
+        self.train_background_reg = 1e-4
+        self.train_foreground_only = 0.9
+        self.train_sample_cache = True
 
-        self.train_dist_loss           = 'mae'
-        self.train_loss_weights        = (1,0.2) if self.n_classes is None else (1,0.2,1)
-        self.train_class_weights       = (1,1) if self.n_classes is None else (1,)*(self.n_classes+1)
-        self.train_epochs              = 400
-        self.train_steps_per_epoch     = 100
-        self.train_learning_rate       = 0.0003
-        self.train_batch_size          = 1
-        self.train_n_val_patches       = None
-        self.train_tensorboard         = True
+        self.train_dist_loss = 'mae'
+        self.train_loss_weights = (1, 0.2) if self.n_classes is None else (1, 0.2, 1)
+        self.train_class_weights = (1, 1) if self.n_classes is None else (1,) * (self.n_classes + 1)
+        self.train_epochs = 400
+        self.train_steps_per_epoch = 100
+        self.train_learning_rate = 0.0003
+        self.train_batch_size = 1
+        self.train_n_val_patches = None
+        self.train_tensorboard = True
         # the parameter 'min_delta' was called 'epsilon' for keras<=2.1.5
         # keras.__version__ was removed in tensorflow 2.13.0
-        min_delta_key = 'epsilon' if Version(getattr(keras, '__version__', '9.9.9'))<=Version('2.1.5') else 'min_delta'
-        self.train_reduce_lr           = {'factor': 0.5, 'patience': 40, min_delta_key: 0}
+        min_delta_key = 'epsilon' if Version(getattr(keras, '__version__', '9.9.9')) <= Version(
+            '2.1.5') else 'min_delta'
+        self.train_reduce_lr = {'factor': 0.5, 'patience': 40, min_delta_key: 0}
 
-        self.use_gpu                   = False
+        self.use_gpu = False
 
         # remove derived attributes that shouldn't be overwritten
         for k in ('n_dim', 'n_channel_out', 'n_rays', 'rays_json'):
-            try: del kwargs[k]
-            except KeyError: pass
+            try:
+                del kwargs[k]
+            except KeyError:
+                pass
 
         self.update_parameters(False, **kwargs)
 
         # FIXME: put into is_valid()
         if not len(self.train_loss_weights) == (2 if self.n_classes is None else 3):
-            raise ValueError(f"train_loss_weights {self.train_loss_weights} not compatible with n_classes ({self.n_classes}): must be 3 weights if n_classes is not None, otherwise 2")
+            raise ValueError(
+                f"train_loss_weights {self.train_loss_weights} not compatible with n_classes ({self.n_classes}): must be 3 weights if n_classes is not None, otherwise 2")
 
-        if not len(self.train_class_weights) == (2 if self.n_classes is None else self.n_classes+1):
-            raise ValueError(f"train_class_weights {self.train_class_weights} not compatible with n_classes ({self.n_classes}): must be 'n_classes + 1' weights if n_classes is not None, otherwise 2")
+        if not len(self.train_class_weights) == (2 if self.n_classes is None else self.n_classes + 1):
+            raise ValueError(
+                f"train_class_weights {self.train_class_weights} not compatible with n_classes ({self.n_classes}): must be 'n_classes + 1' weights if n_classes is not None, otherwise 2")
 
 
 class StarDist3D(StarDistBase):
@@ -350,7 +361,6 @@ class StarDist3D(StarDistBase):
         """See class docstring."""
         super().__init__(config, name=name, basedir=basedir)
 
-
     def _build(self):
         if self.config.backbone == "unet":
             return self._build_unet()
@@ -359,15 +369,14 @@ class StarDist3D(StarDistBase):
         else:
             raise NotImplementedError(self.config.backbone)
 
-
     def _build_unet(self):
         assert self.config.backbone == 'unet'
-        unet_kwargs = {k[len('unet_'):]:v for (k,v) in vars(self.config).items() if k.startswith('unet_')}
+        unet_kwargs = {k[len('unet_'):]: v for (k, v) in vars(self.config).items() if k.startswith('unet_')}
 
         input_img = Input(self.config.net_input_shape, name='input')
 
         # maxpool input image to grid size
-        pooled = np.array([1,1,1])
+        pooled = np.array([1, 1, 1])
         pooled_img = input_img
         while tuple(pooled) != tuple(self.config.grid):
             pool = 1 + (np.asarray(self.config.grid) > pooled)
@@ -385,41 +394,42 @@ class StarDist3D(StarDistBase):
         else:
             unet = unet_base
 
-        output_prob = Conv3D(                 1, (1,1,1), name='prob', padding='same', activation='sigmoid')(unet)
-        output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(unet)
+        output_prob = Conv3D(1, (1, 1, 1), name='prob', padding='same', activation='sigmoid')(unet)
+        output_dist = Conv3D(self.config.n_rays, (1, 1, 1), name='dist', padding='same', activation='linear')(unet)
 
         # attach extra classification head when self.n_classes is given
         if self._is_multiclass():
             if self.config.net_conv_after_unet > 0:
-                unet_class  = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
-                                     name='features_class', padding='same', activation=self.config.unet_activation)(unet_base)
+                unet_class = Conv3D(self.config.net_conv_after_unet, self.config.unet_kernel_size,
+                                    name='features_class', padding='same', activation=self.config.unet_activation)(
+                    unet_base)
             else:
-                unet_class  = unet_base
+                unet_class = unet_base
 
-            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(unet_class)
-            return Model([input_img], [output_prob,output_dist,output_prob_class])
+            output_prob_class = Conv3D(self.config.n_classes + 1, (1, 1, 1), name='prob_class', padding='same',
+                                       activation='softmax')(unet_class)
+            return Model([input_img], [output_prob, output_dist, output_prob_class])
         else:
-            return Model([input_img], [output_prob,output_dist])
-
+            return Model([input_img], [output_prob, output_dist])
 
     def _build_resnet(self):
         assert self.config.backbone == 'resnet'
         n_filter = self.config.resnet_n_filter_base
-        resnet_kwargs = dict (
-            kernel_size        = self.config.resnet_kernel_size,
-            n_conv_per_block   = self.config.resnet_n_conv_per_block,
-            batch_norm         = self.config.resnet_batch_norm,
-            kernel_initializer = self.config.resnet_kernel_init,
-            activation         = self.config.resnet_activation,
+        resnet_kwargs = dict(
+            kernel_size=self.config.resnet_kernel_size,
+            n_conv_per_block=self.config.resnet_n_conv_per_block,
+            batch_norm=self.config.resnet_batch_norm,
+            kernel_initializer=self.config.resnet_kernel_init,
+            activation=self.config.resnet_activation,
         )
 
         input_img = Input(self.config.net_input_shape, name='input')
 
         layer = input_img
-        layer = Conv3D(n_filter, (7,7,7), padding="same", kernel_initializer=self.config.resnet_kernel_init)(layer)
-        layer = Conv3D(n_filter, (3,3,3), padding="same", kernel_initializer=self.config.resnet_kernel_init)(layer)
+        layer = Conv3D(n_filter, (7, 7, 7), padding="same", kernel_initializer=self.config.resnet_kernel_init)(layer)
+        layer = Conv3D(n_filter, (3, 3, 3), padding="same", kernel_initializer=self.config.resnet_kernel_init)(layer)
 
-        pooled = np.array([1,1,1])
+        pooled = np.array([1, 1, 1])
         for n in range(self.config.resnet_n_blocks):
             pool = 1 + (np.asarray(self.config.grid) > pooled)
             pooled *= pool
@@ -433,24 +443,26 @@ class StarDist3D(StarDistBase):
             layer = Conv3D(self.config.net_conv_after_resnet, self.config.resnet_kernel_size,
                            name='features', padding='same', activation=self.config.resnet_activation)(layer_base)
 
-        output_prob = Conv3D(                 1, (1,1,1), name='prob', padding='same', activation='sigmoid')(layer)
-        output_dist = Conv3D(self.config.n_rays, (1,1,1), name='dist', padding='same', activation='linear')(layer)
+        output_prob = Conv3D(1, (1, 1, 1), name='prob', padding='same', activation='sigmoid')(layer)
+        output_dist = Conv3D(self.config.n_rays, (1, 1, 1), name='dist', padding='same', activation='linear')(layer)
 
         # attach extra classification head when self.n_classes is given
         if self._is_multiclass():
             if self.config.net_conv_after_resnet > 0:
-                layer_class  = Conv3D(self.config.net_conv_after_resnet, self.config.resnet_kernel_size,
-                                      name='features_class', padding='same', activation=self.config.resnet_activation)(layer_base)
+                layer_class = Conv3D(self.config.net_conv_after_resnet, self.config.resnet_kernel_size,
+                                     name='features_class', padding='same', activation=self.config.resnet_activation)(
+                    layer_base)
             else:
-                layer_class  = layer_base
+                layer_class = layer_base
 
-            output_prob_class  = Conv3D(self.config.n_classes+1, (1,1,1), name='prob_class', padding='same', activation='softmax')(layer_class)
-            return Model([input_img], [output_prob,output_dist,output_prob_class])
+            output_prob_class = Conv3D(self.config.n_classes + 1, (1, 1, 1), name='prob_class', padding='same',
+                                       activation='softmax')(layer_class)
+            return Model([input_img], [output_prob, output_dist, output_prob_class])
         else:
-            return Model([input_img], [output_prob,output_dist])
+            return Model([input_img], [output_prob, output_dist])
 
-
-    def train(self, X, Y, validation_data, classes='auto', augmenter=None, seed=None, epochs=None, steps_per_epoch=None, workers=1):
+    def train(self, X, Y, validation_data, classes='auto', augmenter=None, seed=None, epochs=None, steps_per_epoch=None,
+              workers=1):
         """Train the neural network with the given data.
 
         Parameters
@@ -503,33 +515,34 @@ class StarDist3D(StarDistBase):
         if not self._is_multiclass() and classes is not None:
             warnings.warn("Ignoring given classes as n_classes is set to None")
 
-        isinstance(validation_data,(list,tuple)) or _raise(ValueError())
+        isinstance(validation_data, (list, tuple)) or _raise(ValueError())
         if self._is_multiclass() and len(validation_data) == 2:
             validation_data = tuple(validation_data) + ('auto',)
         ((len(validation_data) == (3 if self._is_multiclass() else 2))
-            or _raise(ValueError(f'len(validation_data) = {len(validation_data)}, but should be {3 if self._is_multiclass() else 2}')))
+         or _raise(ValueError(
+                    f'len(validation_data) = {len(validation_data)}, but should be {3 if self._is_multiclass() else 2}')))
 
         patch_size = self.config.train_patch_size
-        axes = self.config.axes.replace('C','')
+        axes = self.config.axes.replace('C', '')
         div_by = self._axes_div_by(axes)
         [p % d == 0 or _raise(ValueError(
-            "'train_patch_size' must be divisible by {d} along axis '{a}'".format(a=a,d=d)
-         )) for p,d,a in zip(patch_size,div_by,axes)]
+            "'train_patch_size' must be divisible by {d} along axis '{a}'".format(a=a, d=d)
+        )) for p, d, a in zip(patch_size, div_by, axes)]
 
         if not self._model_prepared:
             self.prepare_for_training()
 
-        data_kwargs = dict (
-            rays             = rays_from_json(self.config.rays_json),
-            grid             = self.config.grid,
-            patch_size       = self.config.train_patch_size,
-            anisotropy       = self.config.anisotropy,
-            use_gpu          = self.config.use_gpu,
-            foreground_prob  = self.config.train_foreground_only,
-            n_classes        = self.config.n_classes,
-            sample_ind_cache = self.config.train_sample_cache,
+        data_kwargs = dict(
+            rays=rays_from_json(self.config.rays_json),
+            grid=self.config.grid,
+            patch_size=self.config.train_patch_size,
+            anisotropy=self.config.anisotropy,
+            use_gpu=self.config.use_gpu,
+            foreground_prob=self.config.train_foreground_only,
+            n_classes=self.config.n_classes,
+            sample_ind_cache=self.config.train_sample_cache,
         )
-        worker_kwargs = dict(workers=workers, use_multiprocessing=workers>1)
+        worker_kwargs = dict(workers=workers, use_multiprocessing=workers > 1)
         if IS_KERAS_3_PLUS:
             data_kwargs['keras_kwargs'] = worker_kwargs
             fit_kwargs = {}
@@ -540,42 +553,46 @@ class StarDist3D(StarDistBase):
         n_data_val = len(validation_data[0])
         classes_val = self._parse_classes_arg(validation_data[2], n_data_val) if self._is_multiclass() else None
         n_take = self.config.train_n_val_patches if self.config.train_n_val_patches is not None else n_data_val
-        _data_val = StarDistData3D(validation_data[0],validation_data[1], classes=classes_val, batch_size=n_take, length=1, **data_kwargs)
+        _data_val = StarDistData3D(validation_data[0], validation_data[1], classes=classes_val, batch_size=n_take,
+                                   length=1, **data_kwargs)
         data_val = _data_val[0]
 
         # expose data generator as member for general diagnostics
         self.data_train = StarDistData3D(X, Y, classes=classes, batch_size=self.config.train_batch_size,
-                                         augmenter=augmenter, length=epochs*steps_per_epoch, **data_kwargs)
+                                         augmenter=augmenter, length=epochs * steps_per_epoch, **data_kwargs)
 
         if self.config.train_tensorboard:
             # only show middle slice of 3D inputs/outputs
-            input_slices, output_slices = [[slice(None)]*5], [[slice(None)]*5,[slice(None)]*5]
+            input_slices, output_slices = [[slice(None)] * 5], [[slice(None)] * 5, [slice(None)] * 5]
             i = axes_dict(self.config.axes)['Z']
             channel = axes_dict(self.config.axes)['C']
-            _n_in  = _data_val.patch_size[i] // 2
+            _n_in = _data_val.patch_size[i] // 2
             _n_out = _data_val.patch_size[i] // (2 * (self.config.grid[i] if self.config.grid is not None else 1))
-            input_slices[0][1+i] = _n_in
-            output_slices[0][1+i] = _n_out
-            output_slices[1][1+i] = _n_out
+            input_slices[0][1 + i] = _n_in
+            output_slices[0][1 + i] = _n_out
+            output_slices[1][1 + i] = _n_out
             # show dist for three rays
             _n = min(3, self.config.n_rays)
-            output_slices[1][1+channel] = slice(0,(self.config.n_rays//_n)*_n, self.config.n_rays//_n)
+            output_slices[1][1 + channel] = slice(0, (self.config.n_rays // _n) * _n, self.config.n_rays // _n)
             if self._is_multiclass():
                 _n = min(3, self.config.n_classes)
-                output_slices += [[slice(None)]*5]
-                output_slices[2][1+channel] = slice(1,1+(self.config.n_classes//_n)*_n, self.config.n_classes//_n)
+                output_slices += [[slice(None)] * 5]
+                output_slices[2][1 + channel] = slice(1, 1 + (self.config.n_classes // _n) * _n,
+                                                      self.config.n_classes // _n)
 
             if IS_TF_1:
                 for cb in self.callbacks:
-                    if isinstance(cb,CARETensorBoard):
+                    if isinstance(cb, CARETensorBoard):
                         cb.input_slices = input_slices
                         cb.output_slices = output_slices
                         # target image for dist includes dist_mask and thus has more channels than dist output
-                        cb.output_target_shapes = [None,[None]*5,None]
-                        cb.output_target_shapes[1][1+channel] = data_val[1][1].shape[1+channel]
-            elif self.basedir is not None and not any(isinstance(cb,CARETensorBoardImage) for cb in self.callbacks):
-                self.callbacks.append(CARETensorBoardImage(model=self.keras_model, data=data_val, log_dir=str(self.logdir/'logs'/'images'),
-                                                           n_images=3, prob_out=False, input_slices=input_slices, output_slices=output_slices))
+                        cb.output_target_shapes = [None, [None] * 5, None]
+                        cb.output_target_shapes[1][1 + channel] = data_val[1][1].shape[1 + channel]
+            elif self.basedir is not None and not any(isinstance(cb, CARETensorBoardImage) for cb in self.callbacks):
+                self.callbacks.append(CARETensorBoardImage(model=self.keras_model, data=data_val,
+                                                           log_dir=str(self.logdir / 'logs' / 'images'),
+                                                           n_images=3, prob_out=False, input_slices=input_slices,
+                                                           output_slices=output_slices))
 
         fit = self.keras_model.fit_generator if (IS_TF_1 and not IS_KERAS_3_PLUS) else self.keras_model.fit
         history = fit(iter(self.data_train), validation_data=data_val,
@@ -583,7 +600,8 @@ class StarDist3D(StarDistBase):
                       **fit_kwargs,
                       callbacks=self.callbacks, verbose=1,
                       # set validation batchsize to training batchsize (only works in tf 2.x)
-                      **(dict(validation_batch_size = self.config.train_batch_size) if _tf_version_at_least("2.2.0") else {}))
+                      **(dict(validation_batch_size=self.config.train_batch_size) if _tf_version_at_least(
+                          "2.2.0") else {}))
         self._training_finished()
 
         return history
@@ -623,9 +641,11 @@ class StarDist3D(StarDistBase):
 
         # End the timer
         end_time_NMS = time.time()
+        gc.collect()
 
         # Calculate the elapsed time
         elapsed_time_NMS = end_time_NMS - start_time_NMS
+        print("Time taken for NMS: ", elapsed_time_NMS)
         time_usage.append(elapsed_time_NMS)
         verbose = nms_kwargs.get('verbose', False)
         verbose and print("render polygons...")
@@ -662,6 +682,7 @@ class StarDist3D(StarDistBase):
                                               verbose=verbose)
                 # End the timer
                 end_time_polyhedron_to_label = time.time()
+                gc.collect()
 
                 # Calculate the elapsed time
                 elapsed_time_polyhedron_to_label = end_time_polyhedron_to_label - start_time_polyhedron_to_label
@@ -674,6 +695,7 @@ class StarDist3D(StarDistBase):
                 labels = watershed(-ws_potential, markers=markers, mask=mask)
 
                 end_time_watershed = time.time()
+                gc.collect()
 
                 # Calculate the elapsed time
                 elapsed_time_watershed = end_time_watershed - start_time_watershed
@@ -702,7 +724,7 @@ class StarDist3D(StarDistBase):
                 # print(np.unique(labels))
 
             end_time_overlap = time.time()
-
+            gc.collect()
             # Calculate the elapsed time
             elapsed_time_overlap = end_time_overlap - start_time_overlap
 
@@ -739,22 +761,20 @@ class StarDist3D(StarDistBase):
 
         return time_usage, labels, res_dict
 
-
     def _axes_div_by(self, query_axes):
         if self.config.backbone == "unet":
             query_axes = axes_check_and_normalize(query_axes)
             assert len(self.config.unet_pool) == len(self.config.grid)
             div_by = dict(zip(
-                self.config.axes.replace('C',''),
-                tuple(p**self.config.unet_n_depth * g for p,g in zip(self.config.unet_pool,self.config.grid))
+                self.config.axes.replace('C', ''),
+                tuple(p ** self.config.unet_n_depth * g for p, g in zip(self.config.unet_pool, self.config.grid))
             ))
-            return tuple(div_by.get(a,1) for a in query_axes)
+            return tuple(div_by.get(a, 1) for a in query_axes)
         elif self.config.backbone == "resnet":
-            grid_dict = dict(zip(self.config.axes.replace('C',''), self.config.grid))
-            return tuple(grid_dict.get(a,1) for a in query_axes)
+            grid_dict = dict(zip(self.config.axes.replace('C', ''), self.config.grid))
+            return tuple(grid_dict.get(a, 1) for a in query_axes)
         else:
             raise NotImplementedError()
-
 
     @property
     def _config_class(self):
