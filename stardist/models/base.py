@@ -1254,14 +1254,14 @@ class StarDistBase(BaseModel):
             #     for block in batch
             # ]
             # Get a dictionary of workers to their assigned tasks
-            futures_match = []
+            batch_futures = []
             for j, worker in enumerate(workers):
                 future_match = client.submit(self.predict_instances_block, batch[j],
                                              dask_array, workers=[worker], retries=3, **kwargs)
-                futures_match.append(future_match)
+                batch_futures.append(future_match)
 
-            futures.extend(futures_match)  # Assuming futures is defined elsewhere and used for collecting all futures
-            future_to_index.update({future: idx for idx, future in enumerate(futures_match, start=i)})
+            futures.extend(batch_futures)  # Assuming futures is defined elsewhere and used for collecting all futures
+            future_to_index.update({future: idx for idx, future in enumerate(batch_futures, start=i)})
 
             # Use tqdm to show a progress bar for the completion of futures
             with tqdm(total=len(batch_futures), desc=f"Processing Batch {i // batch_size + 1}") as pbar:
