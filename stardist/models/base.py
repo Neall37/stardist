@@ -4,7 +4,6 @@ import numpy as np
 import sys
 import warnings
 import math
-from csbdeep.utils import normalize
 from tqdm import tqdm
 from multiprocessing import Pool, Manager, cpu_count
 from collections import namedtuple
@@ -13,6 +12,7 @@ import threading
 import functools
 import scipy.ndimage as ndi
 import numbers
+from csbdeep.utils import normalize
 
 from csbdeep.models.base_model import BaseModel
 from csbdeep.utils.tf import export_SavedModel, keras_import, IS_TF_1, CARETensorBoard, BACKEND as K
@@ -1246,14 +1246,22 @@ class StarDistBase(BaseModel):
         futures = []
         future_to_index = {}
         predictions = [None] * len(blocks)
+        workers = [w['address'] for w in client.scheduler_info()['workers']]
         for i in range(0, len(blocks), batch_size):
             batch = blocks[i:i + batch_size]
-            batch_futures = [
-                client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
-                for block in batch
-            ]
-            futures.extend(batch_futures)
-            future_to_index.update({future: idx for idx, future in enumerate(batch_futures, start=i)})
+            # batch_futures = [
+            #     client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
+            #     for block in batch
+            # ]
+            # Get a dictionary of workers to their assigned tasks
+            futures_match = []
+            for j, worker in enumerate(workers):
+                future_match = client.submit(self.predict_instances_block, batch[j],
+                                             dask_array, workers=[worker], retries=3, **kwargs)
+                futures_match.append(future_match)
+
+            futures.extend(futures_match)  # Assuming futures is defined elsewhere and used for collecting all futures
+            future_to_index.update({future: idx for idx, future in enumerate(futures_match, start=i)})
 
             # Use tqdm to show a progress bar for the completion of futures
             with tqdm(total=len(batch_futures), desc=f"Processing Batch {i // batch_size + 1}") as pbar:
