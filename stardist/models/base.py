@@ -1047,8 +1047,81 @@ class StarDistBase(BaseModel):
         labels = relabel_sequential(labels, label_offset)[0]
         return labels, polys, block
 
-    def predict_instances_big_dask(self, cluster, batch_size, img, axes, block_size, min_overlap, context=None,
-                                   labels_out=None, labels_out_dtype=np.int32, show_progress=True, **kwargs):
+    def check_blocksize(self, img, axes, required_block_num, min_overlap, ignore_z, context=None):
+        from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # Assumed correctly implemented elsewhere
+
+        n = img.ndim
+        img_shape = img.shape
+        axes = axes_check_and_normalize(axes, length=n)
+        if np.isscalar(required_block_num):  required_block_num = n * [required_block_num]
+
+        if ignore_z:
+            required_block_num[0] = 1
+            required_block_num_total = np.prod(required_block_num)
+        else:
+            required_block_num_total = np.prod(required_block_num)
+
+        axes = axes_check_and_normalize(axes, length=n)
+        grid = self._axes_div_by(axes)
+        grid = list(grid)
+
+        if context is None:
+            context = self._axes_tile_overlap(axes)
+        context = list(context)
+
+        # Convert scalars to lists
+        if np.isscalar(min_overlap):
+            min_overlap = [min_overlap] * n
+
+        # Initial guess for block_size based on even distribution
+        required_min = [0, 0, 0]
+        block_size = [max(1, s // required_block_num[i]) for i, s in enumerate(img_shape)]
+        for i in range(n):
+            required_block_num_1 = required_block_num[i]
+            required_min_2 = int((img_shape[i] + (required_block_num_1 - 1) * min_overlap[i]) / required_block_num_1)
+            required_min_1 = min_overlap[i] + 2 * context[i] + 1
+            required_min[i] = max(required_min_1, required_min_2)
+        # Ensure initial block sizes respect the constraints
+        for i in range(n):
+            block_size[i] = max(block_size[i], required_min[i])
+            block_size[i] = min(block_size[i], img_shape[i])  # Ensure block size does not exceed dimension size
+        attempt_count = 0
+        max_attempts = 3000  # Limit iterations to prevent infinite loops
+
+        while attempt_count < max_attempts:
+            attempt_count += 1
+            # Adjust block sizes to be grid divisible
+            block_size = [_grid_divisible(grid[i], block_size[i], name='block_size', verbose=False) for i in range(n)]
+            # Re-check constraints after adjustment
+            for i in range(n):
+                block_size[i] = max(block_size[i], required_min[i])
+                block_size[i] = min(block_size[i], img_shape[i])
+
+                # Estimate number of blocks
+            blocks = BlockND.cover(img_shape, axes, block_size, min_overlap, context, grid, ignore_z)
+            num_blocks = len(blocks)
+
+            # Check if the number of blocks matches the required number
+            if num_blocks == required_block_num_total:
+                print(f'Successfully adjusted block sizes to achieve the desired number of blocks: {block_size}')
+                break
+            elif num_blocks < required_block_num_total:
+                block_size = [max(1, b - 2) for b in block_size]  # Decrease block size to increase number of blocks
+            else:
+                block_size = [b + 1 for b in block_size]  # Increase block size to decrease number of blocks
+            # Ensure block sizes do not exceed dimension sizes
+            block_size = [min(bs, sz) for bs, sz in zip(block_size, img_shape)]
+
+        if attempt_count >= max_attempts:
+            print("Failed to adjust block sizes within the maximum number of attempts.")
+        else:
+            print("Adjusted block sizes:", block_size)
+            print("The number of blocks:", num_blocks)
+
+    def predict_instances_big_dask(self, cluster, batch_size, img, axes, block_size,
+                                   min_overlap, task_per_worker=1, ignore_z=False, context=None, labels_out=None,
+                                   labels_out_dtype=np.int32,
+                                   show_progress=True, **kwargs):
         """Predict instance segmentation from very large input images.
 
         Intended to be used when `predict_instances` cannot be used due to memory limitations.
@@ -1141,7 +1214,7 @@ class StarDistBase(BaseModel):
                 print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
 
         # create block cover
-        blocks = BlockND.cover(img_shape, axes, block_size, min_overlap, context, grid)
+        blocks = BlockND.cover(img_shape, axes, block_size, min_overlap, context, grid, ignore_z)
         num_blocks = len(blocks)
         print("The number of blocks:", num_blocks)
         if np.isscalar(labels_out) and bool(labels_out) is False:
@@ -1246,18 +1319,29 @@ class StarDistBase(BaseModel):
         futures = []
         future_to_index = {}
         predictions = [None] * len(blocks)
-        workers = [w['address'] for w in client.scheduler_info()['workers']]
+        scheduler_info = client.scheduler_info()
+        for i in scheduler_info['workers']:
+            print(i)
+
+        workers = [worker for worker in scheduler_info['workers'] for _ in range(int(task_per_worker))]
+        print(workers)
         for i in range(0, len(blocks), batch_size):
             batch = blocks[i:i + batch_size]
+            batch_futures = []
             # batch_futures = [
             #     client.submit(self.predict_instances_block, block, dask_array, retries=3, **kwargs)
             #     for block in batch
             # ]
             # Get a dictionary of workers to their assigned tasks
-            batch_futures = []
-            for j, worker in enumerate(workers):
-                future_match = client.submit(self.predict_instances_block, batch[j],
-                                             dask_array, workers=[worker], retries=3, **kwargs)
+            for j, block in enumerate(batch):
+                # Ensure not to exceed the list of available workers
+                worker_index = j % len(workers)
+                worker = workers[worker_index]
+
+                future_match = client.submit(
+                    self.predict_instances_block, block, dask_array,
+                    workers=[worker], retries=3, **kwargs
+                )
                 batch_futures.append(future_match)
 
             futures.extend(batch_futures)  # Assuming futures is defined elsewhere and used for collecting all futures
