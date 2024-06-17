@@ -1048,7 +1048,7 @@ class StarDistBase(BaseModel):
         return labels, polys, block
 
     def check_blocksize(self, img, axes, required_block_num, min_overlap, ignore_z, context=None):
-        from ..big import _grid_divisible, BlockND, OBJECT_KEYS  # Assumed correctly implemented elsewhere
+        from ..big import _grid_divisible, BlockND, OBJECT_KEYS
 
         n = img.ndim
         img_shape = img.shape
@@ -1117,6 +1117,75 @@ class StarDistBase(BaseModel):
         else:
             print("Adjusted block sizes:", block_size)
             print("The number of blocks:", num_blocks)
+
+    def generate_blocks(self, img, axes, block_size,
+                        min_overlap, ignore_z=False, context=None, labels_out=None, labels_out_dtype=np.int32,
+                        show_progress=True, **kwargs):
+        from ..big import _grid_divisible, BlockND, OBJECT_KEYS
+
+        n = img.ndim
+        img_shape = img.shape
+        axes = axes_check_and_normalize(axes, length=n)
+        grid = self._axes_div_by(axes)
+        axes_out = self._axes_out.replace('C', '')
+        shape_dict = dict(zip(axes, img_shape))
+        shape_out = tuple(shape_dict[a] for a in axes_out)
+
+        if context is None:
+            context = self._axes_tile_overlap(axes)
+
+        if np.isscalar(block_size):  block_size = n * [block_size]
+        if np.isscalar(min_overlap): min_overlap = n * [min_overlap]
+        if np.isscalar(context):     context = n * [context]
+        block_size, min_overlap, context = list(block_size), list(min_overlap), list(context)
+        assert n == len(block_size) == len(min_overlap) == len(context)
+
+        if 'C' in axes:
+            # single block for channel axis
+            i = axes_dict(axes)['C']
+            # if (block_size[i], min_overlap[i], context[i]) != (None, None, None):
+            #     print("Ignoring values of 'block_size', 'min_overlap', and 'context' for channel axis " +
+            #           "(set to 'None' to avoid this warning).", file=sys.stderr, flush=True)
+            block_size[i] = img_shape[i]
+            min_overlap[i] = context[i] = 0
+
+        block_size = tuple(
+            _grid_divisible(g, v, name='block_size', verbose=False) for v, g, a in zip(block_size, grid, axes))
+        min_overlap = tuple(
+            _grid_divisible(g, v, name='min_overlap', verbose=False) for v, g, a in zip(min_overlap, grid, axes))
+        context = tuple(_grid_divisible(g, v, name='context', verbose=False) for v, g, a in zip(context, grid, axes))
+
+        # print(f"input: shape {img_shape} with axes {axes}")
+        print(f'effective: block_size={block_size}, min_overlap={min_overlap}, context={context}', flush=True)
+
+        for a, c, o in zip(axes, context, self._axes_tile_overlap(axes)):
+            if c < o:
+                print(f"{a}: context of {c} is small, recommended to use at least {o}", flush=True)
+
+        # create block cover
+        blocks = BlockND.cover(img_shape, axes, block_size, min_overlap, context, grid, ignore_z)
+        num_blocks = len(blocks)
+        print("The number of blocks:", num_blocks)
+        if np.isscalar(labels_out) and bool(labels_out) is False:
+            labels_out = None
+        else:
+            if labels_out is None:
+                labels_out = np.zeros(shape_out, dtype=labels_out_dtype)
+            else:
+                labels_out.shape == shape_out or _raise(
+                    ValueError(f"'labels_out' must have shape {shape_out} (axes {axes_out})."))
+
+        polys_all = {}
+        # problem_ids = []
+        label_offset = 1
+
+        kwargs_override = dict(axes=axes, overlap_label=None, return_labels=True, return_predict=False)
+        if show_progress:
+            kwargs_override['show_tile_progress'] = False  # disable progress for predict_instances
+        for k, v in kwargs_override.items():
+            if k in kwargs: print(f"changing '{k}' from {kwargs[k]} to {v}", flush=True)
+            kwargs[k] = v
+        return blocks, axes, label_offset, axes_out, OBJECT_KEYS
 
     def predict_instances_big_dask(self, cluster, batch_size, img, axes, block_size,
                                    min_overlap, task_per_worker=1, ignore_z=False, context=None, labels_out=None,
