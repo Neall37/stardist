@@ -1117,6 +1117,7 @@ class StarDistBase(BaseModel):
         else:
             print("Adjusted block sizes:", block_size)
             print("The number of blocks:", num_blocks)
+        return block_size
 
     def generate_blocks(self, img, axes, block_size,
                         min_overlap, ignore_z=False, context=None, labels_out=None, labels_out_dtype=np.int32,
