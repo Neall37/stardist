@@ -122,6 +122,7 @@ setup(
         'scikit-image',
         'numba',
         'imageio',
+        'dask'
     ],
 
     extras_require={
